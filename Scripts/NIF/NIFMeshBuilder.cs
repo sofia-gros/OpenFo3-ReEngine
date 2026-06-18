@@ -4,68 +4,115 @@ using System.IO;
 
 namespace OpenFo3.NIF
 {
+    /// <summary>
+    /// Holds pre-parsed geometry data from a NIF file, safe to create on worker threads.
+    /// Call BuildArrayMesh() on the main thread to create the Godot ArrayMesh.
+    /// </summary>
+    public class NIFGeometryData
+    {
+        public List<(Vector3[] Vertices, int[] Indices, Transform3D Transform)> Surfaces = new();
+    }
+
     public static class NIFMeshBuilder
     {
-        // Geometry block types used in FO3/Oblivion NIFs
-        private static readonly HashSet<string> _geomTriStrips = new() { "NiTriStripsData" };
-        private static readonly HashSet<string> _geomTriShape = new() { "NiTriShapeData", "BSTriShape", "BSLODTriShape", "BSMeshLODTriShape", "BSSubIndexTriShape", "BSDynamicTriShape" };
+        /// <summary>
+        /// Parse NIF hierarchy and extract geometry data. Thread-safe (no Godot API calls).
+        /// </summary>
+        public static NIFGeometryData ExtractGeometry(NIFReader nif)
+        {
+            var geom = new NIFGeometryData();
+            if (nif.Blocks.Count == 0) return geom;
 
-        public static ArrayMesh Build(NIFReader nif)
+            foreach (int rootIdx in nif.RootBlockIndices)
+            {
+                TraverseExtract(nif, rootIdx, Transform3D.Identity, geom);
+            }
+
+            return geom;
+        }
+
+        /// <summary>
+        /// Build an ArrayMesh from pre-extracted geometry. MUST be called on main thread.
+        /// </summary>
+        public static ArrayMesh BuildArrayMesh(NIFGeometryData geom)
         {
             var mesh = new ArrayMesh();
-            int surfacesBuilt = 0;
+            float worldScale = 0.015f;
 
-            foreach (var block in nif.Blocks)
+            foreach (var surface in geom.Surfaces)
             {
-                if (_geomTriStrips.Contains(block.Type))
+                if (surface.Vertices == null || surface.Indices == null || surface.Indices.Length < 3)
+                    continue;
+
+                Vector3[] godotVertices = new Vector3[surface.Vertices.Length];
+                for (int i = 0; i < surface.Vertices.Length; i++)
                 {
-                    var (verts, inds) = NiTriStripsDataParser.Parse(block.Data);
-                    BuildSurface(mesh, verts, inds);
-                    surfacesBuilt++;
+                    var v = surface.Transform * surface.Vertices[i];
+                    v *= worldScale;
+                    godotVertices[i] = new Vector3(v.X, v.Z, -v.Y);
                 }
-                else if (_geomTriShape.Contains(block.Type))
-                {
-                    var (verts, inds) = NiTriShapeDataParser.Parse(block.Data);
-                    BuildSurface(mesh, verts, inds);
-                    surfacesBuilt++;
-                }
-                else
-                {
-                    // GD.Print($"[NIFBuilder] Skipping: {block.Type} size={block.Data.Length}");
-                }
+
+                var arrays = new Godot.Collections.Array();
+                arrays.Resize((int)Mesh.ArrayType.Max);
+                arrays[(int)Mesh.ArrayType.Vertex] = godotVertices;
+                arrays[(int)Mesh.ArrayType.Index] = surface.Indices;
+
+                mesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays);
             }
-            // GD.Print($"[NIFBuilder] Built {surfacesBuilt}/{nif.Blocks.Count} surfaces.");
+
             return mesh;
         }
 
-        private static void BuildSurface(ArrayMesh mesh, Vector3[] vertices, int[] indices)
+        /// <summary>
+        /// Convenience: parse and build on main thread (for single-threaded usage).
+        /// </summary>
+        public static ArrayMesh Build(NIFReader nif)
         {
-            if (vertices == null || vertices.Length == 0) return;
+            var geom = ExtractGeometry(nif);
+            return BuildArrayMesh(geom);
+        }
 
-            // // GD.Print($"[NIFBuilder] BuildSurface: V:{vertices.Length} I:{indices?.Length ?? 0}");
+        private static void TraverseExtract(NIFReader nif, int blockIdx, Transform3D parentTransform, NIFGeometryData geom)
+        {
+            if (blockIdx < 0 || blockIdx >= nif.Blocks.Count) return;
+            var block = nif.Blocks[blockIdx];
 
-            // FO3 Coordinate Conversion (Gamebryo to Godot) and Scale
-            float worldScale = 0.015f;
-            Vector3[] godotVertices = new Vector3[vertices.Length];
-            for (int i = 0; i < vertices.Length; i++)
+            var node = NIFBlockResolver.Resolve(block);
+            if (node == null) return;
+
+            // Local transform
+            var localTransform = new Transform3D(node.Rotation, node.Translation);
+            localTransform.Basis = localTransform.Basis.Scaled(new Vector3(node.Scale, node.Scale, node.Scale));
+            var globalTransform = parentTransform * localTransform;
+
+            if (node.DataIndex != -1)
             {
-                var v = vertices[i] * worldScale;
-                // Gamebryo: X forward, Y left, Z up? No, usually X, Y, Z.
-                // Fallout uses: X, Y, Z. Godot uses: X, Y, -Z (right-handed vs left-handed usually, or just Z/Y swap)
-                // Common conversion for FO3 to Godot: (X, Z, -Y)
-                godotVertices[i] = new Vector3(v.X, v.Z, -v.Y);
+                if (node.DataIndex >= 0 && node.DataIndex < nif.Blocks.Count)
+                {
+                    var dataBlock = nif.Blocks[node.DataIndex];
+                    Vector3[] verts = null;
+                    int[] inds = null;
+
+                    if (dataBlock.Type == "NiTriStripsData")
+                    {
+                        (verts, inds) = NiTriStripsDataParser.Parse(dataBlock.Data);
+                    }
+                    else if (dataBlock.Type == "NiTriShapeData")
+                    {
+                        (verts, inds) = NiTriShapeDataParser.Parse(dataBlock.Data);
+                    }
+
+                    if (verts != null && inds != null && inds.Length >= 3)
+                    {
+                        geom.Surfaces.Add((verts, inds, globalTransform));
+                    }
+                }
             }
 
-            var arrays = new Godot.Collections.Array();
-            arrays.Resize((int)Mesh.ArrayType.Max);
-            arrays[(int)Mesh.ArrayType.Vertex] = godotVertices;
-            
-            if (indices != null && indices.Length >= 3)
+            foreach (int childIdx in node.Children)
             {
-                arrays[(int)Mesh.ArrayType.Index] = indices;
+                TraverseExtract(nif, childIdx, globalTransform, geom);
             }
-            
-            mesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays);
         }
     }
 }

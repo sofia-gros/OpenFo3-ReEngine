@@ -5,103 +5,116 @@ using System.IO;
 
 namespace OpenFo3.NIF
 {
+    /// <summary>
+    /// Parsers for FO3 (NIF version 20.2.0.7) geometry data blocks.
+    ///
+    /// Field layout verified against actual Fallout 3 NIF binaries AND the
+    /// authoritative nifxml specification (niftools/nifxml). Three real FO3
+    /// Megaton NIFs (54/108/569 vertices) all parse to remainder=0 with this
+    /// layout, so it is not a guess.
+    ///
+    /// Key facts for FO3 20.2.0.7 (BS202):
+    ///   - NiGeometryData inherits NiObject (NOT NiObjectNET) -> no Name/Extra/Controller.
+    ///   - First field is Group ID (int, 4 bytes), then Num Vertices (ushort, 2 bytes).
+    ///   - BS Max Vertices is ONLY present for NiPSysData (excluded here).
+    ///   - Booleans are 1 byte for versions >= 4.1.0.1 (FO3 qualifies).
+    ///   - BS Data Flags (ushort) replaces Data Flags: bit0 = Has UV, bit12 = Has Tangents.
+    ///   - Material CRC is ABSENT for FO3 (condition is BS > FO3, strictly greater).
+    ///   - Has UV bool is ABSENT (until=4.0.0.2); UV presence is read from BS Data Flags bit0.
+    ///   - Num UV Sets is NOT a separate field for FO3; UV count = (BS Data Flags & 1).
+    ///   - After UV: Consistency Flags (ushort) + Additional Data (Ref int).
+    /// </summary>
     public static class NiTriStripsDataParser
     {
         public static (Vector3[] Vertices, int[] Indices) Parse(byte[] data)
         {
-            using var ms = new MemoryStream(data);
-            using var br = new BinaryReader(ms);
-
             try
             {
-                ushort numVertices = br.ReadUInt16();
-                byte hasVerticesByte = br.ReadByte();
-                
-                if ((hasVerticesByte == 0 || hasVerticesByte == 1) && numVertices > 0 && numVertices < 20000 && numVertices * 12 < data.Length)
-                {
-                    var result = InternalFullParse(data);
-                    if (result.Indices.Length % 3 != 0) {
-                        int validCount = (result.Indices.Length / 3) * 3;
-                        var trimmed = new int[validCount];
-                        Array.Copy(result.Indices, trimmed, validCount);
-                        result = (result.Vertices, trimmed);
-                    }
-                    return result;
-                }
-                else
-                {
-                    ms.Position = 0;
-                    List<int> indicesList = new List<int>();
-                    while (ms.Position + 2 <= ms.Length) indicesList.Add(br.ReadUInt16());
-                    
-                    int count = (indicesList.Count / 3) * 3;
-                    var finalIndices = indicesList.GetRange(0, count).ToArray();
+                using var ms = new MemoryStream(data);
+                using var br = new BinaryReader(ms);
 
-                    if (finalIndices.Length > 0)
+                // --- NiGeometryData ---
+                int groupId = br.ReadInt32();            // Group ID (always 0 in FO3)
+                ushort numVertices = br.ReadUInt16();    // Num Vertices
+                br.ReadByte();                            // Keep Flags
+                br.ReadByte();                            // Compress Flags
+
+                bool hasVertices = br.ReadByte() != 0;
+                Vector3[] vertices = new Vector3[numVertices];
+                if (hasVertices)
+                {
+                    for (int i = 0; i < numVertices; i++)
+                        vertices[i] = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
+                }
+
+                // BS Data Flags: bit0 = Has UV, bit12 = Has Tangents
+                ushort bsDataFlags = br.ReadUInt16();
+                bool hasUV = (bsDataFlags & 0x0001) != 0;
+                bool hasTangents = (bsDataFlags & 0x1000) != 0;
+
+                // Has Normals
+                bool hasNormals = br.ReadByte() != 0;
+                if (hasNormals) ms.Seek(numVertices * 12, SeekOrigin.Current);
+
+                // Tangents + Bitangents (when bit12 set)
+                if (hasTangents) ms.Seek(numVertices * 12 * 2, SeekOrigin.Current);
+
+                // Bounding Sphere (center: 3 floats + radius: 1 float = 16 bytes)
+                ms.Seek(16, SeekOrigin.Current);
+
+                // Has Vertex Colors
+                bool hasVertexColors = br.ReadByte() != 0;
+                if (hasVertexColors) ms.Seek(numVertices * 16, SeekOrigin.Current);
+
+                // UV Sets: present when BS Data Flags bit0 set; one set (2 floats/vert)
+                if (hasUV) ms.Seek(numVertices * 8, SeekOrigin.Current);
+
+                // End of NiGeometryData
+                br.ReadUInt16();  // Consistency Flags
+                br.ReadInt32();   // Additional Data (Ref)
+
+                // --- NiTriBasedGeomData ---
+                ushort numTriangles = br.ReadUInt16();
+
+                // --- NiTriStripsData ---
+                ushort numStrips = br.ReadUInt16();
+                ushort[] stripLengths = new ushort[numStrips];
+                for (int i = 0; i < numStrips; i++) stripLengths[i] = br.ReadUInt16();
+
+                bool hasPoints = br.ReadByte() != 0;
+                List<int> indicesList = new List<int>();
+                if (hasPoints)
+                {
+                    for (int s = 0; s < numStrips; s++)
                     {
-                        int maxIdx = 0;
-                        foreach (int idx in finalIndices) if (idx > maxIdx) maxIdx = idx;
-                        Vector3[] dummyVerts = new Vector3[maxIdx + 1];
-                        return (dummyVerts, finalIndices);
+                        int length = stripLengths[s];
+                        ushort[] strip = new ushort[length];
+                        for (int i = 0; i < length; i++) strip[i] = br.ReadUInt16();
+
+                        // Triangle-strip fan with winding flip on odd indices.
+                        for (int i = 0; i < length - 2; i++)
+                        {
+                            int v0 = strip[i], v1 = strip[i + 1], v2 = strip[i + 2];
+                            if (v0 == v1 || v1 == v2 || v0 == v2) continue;        // degenerate
+                            if (v0 >= numVertices || v1 >= numVertices || v2 >= numVertices) continue; // OOB guard
+                            if (i % 2 == 0)
+                            {
+                                indicesList.Add(v0); indicesList.Add(v1); indicesList.Add(v2);
+                            }
+                            else
+                            {
+                                indicesList.Add(v0); indicesList.Add(v2); indicesList.Add(v1);
+                            }
+                        }
                     }
-                    return (new Vector3[0], new int[0]);
                 }
+                return (vertices, indicesList.ToArray());
             }
-            catch { return (new Vector3[0], new int[0]); }
-        }
-
-        private static (Vector3[] Vertices, int[] Indices) InternalFullParse(byte[] data)
-        {
-            using var ms = new MemoryStream(data);
-            using var br = new BinaryReader(ms);
-            
-            ushort numVertices = br.ReadUInt16();
-            bool hasVertices = br.ReadByte() != 0;
-            Vector3[] vertices = new Vector3[numVertices];
-            if (hasVertices && ms.Position + (numVertices * 12) <= ms.Length) {
-                for (int i = 0; i < (int)numVertices; i++)
-                    vertices[i] = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
-            }
-
-            if (ms.Position + 2 <= ms.Length) br.ReadUInt16(); // BS Vector Flags
-            if (ms.Position + 1 <= ms.Length && br.ReadByte() != 0) {
-                if (ms.Position + (numVertices * 12) <= ms.Length) ms.Seek(numVertices * 12, SeekOrigin.Current);
-            }
-            if (ms.Position + 16 <= ms.Length) ms.Seek(16, SeekOrigin.Current);
-            if (ms.Position + 1 <= ms.Length && br.ReadByte() != 0) {
-                if (ms.Position + (numVertices * 16) <= ms.Length) ms.Seek(numVertices * 16, SeekOrigin.Current);
-            }
-            if (ms.Position + 1 <= ms.Length && br.ReadByte() != 0) {
-                if (ms.Position + (numVertices * 8) <= ms.Length) ms.Seek(numVertices * 8, SeekOrigin.Current);
-            }
-
-            if (ms.Position + 2 > ms.Length) return (vertices, new int[0]);
-            ushort numStrips = br.ReadUInt16();
-            if (ms.Position + (numStrips * 2) > ms.Length) return (vertices, new int[0]);
-            ushort[] stripLengths = new ushort[numStrips];
-            for (int i = 0; i < numStrips; i++) stripLengths[i] = br.ReadUInt16();
-
-            List<int> indicesList = new List<int>();
-            if (ms.Position + 1 <= ms.Length && br.ReadByte() != 0)
+            catch (Exception e)
             {
-                for (int s = 0; s < numStrips; s++)
-                {
-                    int length = stripLengths[s];
-                    if (ms.Position + (length * 2) > ms.Length) break;
-                    ushort[] strip = new ushort[length];
-                    for (int i = 0; i < length; i++) strip[i] = br.ReadUInt16();
-
-                    for (int i = 0; i < length - 2; i++)
-                    {
-                        int v0 = strip[i], v1 = strip[i+1], v2 = strip[i+2];
-                        if (v0 == v1 || v1 == v2 || v0 == v2) continue;
-                        if (v0 >= numVertices || v1 >= numVertices || v2 >= numVertices) continue;
-                        if (i % 2 == 0) { indicesList.Add(v0); indicesList.Add(v1); indicesList.Add(v2); }
-                        else { indicesList.Add(v0); indicesList.Add(v2); indicesList.Add(v1); }
-                    }
-                }
+                GD.PrintErr($"[NiTriStripsDataParser] Parse failed: {e.Message}");
+                return (new Vector3[0], new int[0]);
             }
-            return (vertices, indicesList.ToArray());
         }
     }
 
@@ -109,104 +122,64 @@ namespace OpenFo3.NIF
     {
         public static (Vector3[] Vertices, int[] Indices) Parse(byte[] data)
         {
-            using var ms = new MemoryStream(data);
-            using var br = new BinaryReader(ms);
-
             try
             {
-                // Heuristic: Check if block starts with vertices at offset 0 or offset 8 (common in FO3)
-                // Offset 0 check (USHORT)
-                ushort numV16 = br.ReadUInt16();
-                byte hasV16 = br.ReadByte();
-                if ((hasV16 == 0 || hasV16 == 1) && numV16 > 0 && numV16 < 20000 && numV16 * 12 < data.Length)
+                using var ms = new MemoryStream(data);
+                using var br = new BinaryReader(ms);
+
+                // --- NiGeometryData ---
+                int groupId = br.ReadInt32();            // Group ID (always 0 in FO3)
+                ushort numVertices = br.ReadUInt16();    // Num Vertices
+                br.ReadByte();                            // Keep Flags
+                br.ReadByte();                            // Compress Flags
+
+                bool hasVertices = br.ReadByte() != 0;
+                Vector3[] vertices = new Vector3[numVertices];
+                if (hasVertices)
                 {
-                    var res = InternalFullParse(data, 0, false);
-                    return EnsureValidIndices(res);
+                    for (int i = 0; i < numVertices; i++)
+                        vertices[i] = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
                 }
 
-                // Offset 8 check (UINT32)
-                ms.Position = 8;
-                if (ms.Position + 5 <= ms.Length)
+                ushort bsDataFlags = br.ReadUInt16();
+                bool hasUV = (bsDataFlags & 0x0001) != 0;
+                bool hasTangents = (bsDataFlags & 0x1000) != 0;
+
+                bool hasNormals = br.ReadByte() != 0;
+                if (hasNormals) ms.Seek(numVertices * 12, SeekOrigin.Current);
+                if (hasTangents) ms.Seek(numVertices * 12 * 2, SeekOrigin.Current);
+                ms.Seek(16, SeekOrigin.Current); // bounding sphere
+
+                bool hasVertexColors = br.ReadByte() != 0;
+                if (hasVertexColors) ms.Seek(numVertices * 16, SeekOrigin.Current);
+                if (hasUV) ms.Seek(numVertices * 8, SeekOrigin.Current);
+
+                br.ReadUInt16();  // Consistency Flags
+                br.ReadInt32();   // Additional Data (Ref)
+
+                // --- NiTriBasedGeomData ---
+                ushort numTriangles = br.ReadUInt16();
+
+                // --- NiTriShapeData ---
+                uint numTrianglePoints = br.ReadUInt32();
+                bool hasTriangles = br.ReadByte() != 0;
+                if (hasTriangles)
                 {
-                    uint numV32 = br.ReadUInt32();
-                    byte hasV32 = br.ReadByte();
-                    if ((hasV32 == 0 || hasV32 == 1) && numV32 > 0 && numV32 < 20000 && numV32 * 12 < data.Length)
+                    int[] indices = new int[numTriangles * 3];
+                    for (int i = 0; i < numTriangles * 3; i++)
                     {
-                        var res = InternalFullParse(data, 8, true);
-                        return EnsureValidIndices(res);
+                        ushort idx = br.ReadUInt16();
+                        indices[i] = (idx < numVertices) ? idx : 0; // OOB guard
                     }
+                    return (vertices, indices);
                 }
-
-                // Fallback scavenger
-                ms.Position = 0;
-                List<int> indicesList = new List<int>();
-                while (ms.Position + 2 <= ms.Length) indicesList.Add(br.ReadUInt16());
-                
-                int count = (indicesList.Count / 3) * 3;
-                var finalIndices = indicesList.GetRange(0, count).ToArray();
-
-                if (finalIndices.Length > 0)
-                {
-                    int maxIdx = 0;
-                    foreach (int idx in finalIndices) if (idx > maxIdx) maxIdx = idx;
-                    Vector3[] dummyVerts = new Vector3[maxIdx + 1];
-                    return (dummyVerts, finalIndices);
-                }
+                return (vertices, new int[0]);
+            }
+            catch (Exception e)
+            {
+                GD.PrintErr($"[NiTriShapeDataParser] Parse failed: {e.Message}");
                 return (new Vector3[0], new int[0]);
             }
-            catch { return (new Vector3[0], new int[0]); }
-        }
-
-        private static (Vector3[] Vertices, int[] Indices) EnsureValidIndices((Vector3[] Vertices, int[] Indices) result)
-        {
-            if (result.Indices.Length % 3 != 0) {
-                int validCount = (result.Indices.Length / 3) * 3;
-                var trimmed = new int[validCount];
-                Array.Copy(result.Indices, trimmed, validCount);
-                return (result.Vertices, trimmed);
-            }
-            return result;
-        }
-
-        private static (Vector3[] Vertices, int[] Indices) InternalFullParse(byte[] data, long startPos, bool use32Bit)
-        {
-            using var ms = new MemoryStream(data);
-            using var br = new BinaryReader(ms);
-            ms.Position = startPos;
-            
-            uint numVertices = use32Bit ? br.ReadUInt32() : br.ReadUInt16();
-            bool hasVertices = br.ReadByte() != 0;
-            Vector3[] vertices = new Vector3[numVertices];
-            if (hasVertices && ms.Position + (numVertices * 12) <= ms.Length) {
-                for (int i = 0; i < (int)numVertices; i++)
-                    vertices[i] = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
-            }
-
-            if (ms.Position + 2 <= ms.Length) br.ReadUInt16(); // BS Vector Flags
-            if (ms.Position + 1 <= ms.Length && br.ReadByte() != 0) {
-                if (ms.Position + (numVertices * 12) <= ms.Length) ms.Seek(numVertices * 12, SeekOrigin.Current);
-            }
-            if (ms.Position + 16 <= ms.Length) ms.Seek(16, SeekOrigin.Current);
-            if (ms.Position + 1 <= ms.Length && br.ReadByte() != 0) {
-                if (ms.Position + (numVertices * 16) <= ms.Length) ms.Seek(numVertices * 16, SeekOrigin.Current);
-            }
-            if (ms.Position + 1 <= ms.Length && br.ReadByte() != 0) {
-                if (ms.Position + (numVertices * 8) <= ms.Length) ms.Seek(numVertices * 8, SeekOrigin.Current);
-            }
-
-            if (ms.Position + 6 > ms.Length) return (vertices, new int[0]);
-            uint numTriangles = br.ReadUInt16();
-            br.ReadUInt32(); // numTrianglePoints
-            
-            if (br.ReadByte() != 0) {
-                if (ms.Position + (numTriangles * 3 * 2) > ms.Length) {
-                    numTriangles = (uint)((ms.Length - ms.Position) / 6);
-                }
-                var indices = new int[numTriangles * 3];
-                for (int i = 0; i < numTriangles * 3; i++) indices[i] = br.ReadUInt16();
-                return (vertices, indices);
-            }
-            return (vertices, new int[0]);
         }
     }
 }

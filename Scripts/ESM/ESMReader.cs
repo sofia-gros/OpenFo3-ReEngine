@@ -18,6 +18,13 @@ namespace OpenFo3.ESM
         public long FileOffset { get; set; }
     }
 
+    public struct RecordEntry
+    {
+        public long Offset;
+        public uint WorldFormId;
+        public uint CellFormId;
+    }
+
     public class ESMReader : IDisposable
     {
         private BinaryReader _reader;
@@ -30,18 +37,18 @@ namespace OpenFo3.ESM
             _reader = new BinaryReader(_stream);
         }
 
-        public Dictionary<uint, long> BuildFormIdIndex(IEnumerable<string> targetTypes)
+        public Dictionary<uint, RecordEntry> BuildFormIdIndex(IEnumerable<string> targetTypes)
         {
-            var index = new Dictionary<uint, long>();
+            var index = new Dictionary<uint, RecordEntry>();
             var targetSet = new HashSet<string>(targetTypes);
             
             _stream.Position = 0;
-            TraverseNodes(_stream.Length, targetSet, index);
+            TraverseNodes(_stream.Length, targetSet, index, 0, 0);
             
             return index;
         }
 
-        private void TraverseNodes(long end, HashSet<string> targetSet, Dictionary<uint, long> index)
+        private void TraverseNodes(long end, HashSet<string> targetSet, Dictionary<uint, RecordEntry> index, uint currentWorld, uint currentCell)
         {
             while (_stream.Position < end && _stream.Position < _stream.Length)
             {
@@ -53,12 +60,28 @@ namespace OpenFo3.ESM
 
                 if (type == "GRUP")
                 {
+                    uint label = _reader.ReadUInt32();
+                    uint groupType = _reader.ReadUInt32();
+                    
+                    // Update context based on Group Type
+                    uint nextWorld = currentWorld;
+                    uint nextCell = currentCell;
+
+                    if (groupType == 1) // World Children
+                    {
+                        nextWorld = label;
+                    }
+                    else if (groupType >= 6 && groupType <= 10) // Cell Children
+                    {
+                        nextCell = label;
+                    }
+
                     // For GRUP, 'size' IS the total size including the 24-byte header.
                     long grupEnd = startOffset + size;
                     if (grupEnd > _stream.Length) grupEnd = _stream.Length;
 
-                    _stream.Seek(16, SeekOrigin.Current); // Skip rest of GRUP header (24 bytes total)
-                    TraverseNodes(grupEnd, targetSet, index);
+                    _stream.Seek(8, SeekOrigin.Current); // Skip rest of GRUP header (already read 16 bytes: 4 tag, 4 size, 4 label, 4 type)
+                    TraverseNodes(grupEnd, targetSet, index, nextWorld, nextCell);
                     _stream.Position = grupEnd;
                 }
                 else
@@ -69,14 +92,18 @@ namespace OpenFo3.ESM
                     
                     if (targetSet.Contains(type))
                     {
-                        index[formId] = startOffset;
+                        index[formId] = new RecordEntry 
+                        { 
+                            Offset = startOffset,
+                            WorldFormId = currentWorld,
+                            CellFormId = currentCell
+                        };
                     }
                     
                     // FO3 Record header is 24 bytes. 'size' is the data size.
                     long nextOffset = startOffset + 24 + size;
                     if (nextOffset > _stream.Length) 
                     {
-                        // GD.PrintErr($"[ESMReader] Record {type} at {startOffset:X} has size {size} exceeding file!");
                         break;
                     }
                     _stream.Position = nextOffset;
@@ -90,11 +117,6 @@ namespace OpenFo3.ESM
             {
                 try
                 {
-                    if (offset < 0 || offset > _stream.Length - 20)
-                    {
-                        // GD.PrintErr($"[ESMReader] Offset {offset:X8} is out of range for stream length {_stream.Length}");
-                    }
-
                     _stream.Position = offset;
                     string type = ReadTag();
                     uint size = _reader.ReadUInt32();
@@ -118,7 +140,6 @@ namespace OpenFo3.ESM
                 }
                 catch (Exception e)
                 {
-                    // GD.PrintErr($"[ESMReader] FAILED GetRecordAtOffset at {offset:X8}: {e.Message}");
                     throw;
                 }
             }
@@ -132,22 +153,13 @@ namespace OpenFo3.ESM
                 {
                     long currentPos = _stream.Position;
                     _stream.Position = record.FileOffset;
-                    if (record.FileOffset + record.Size > _stream.Length)
-                    {
-                        // GD.PrintErr($"[ESMReader] ERROR: Record 0x{record.FormId:X8} ({record.Type}) size {record.Size} goes beyond file length {_stream.Length} at offset {record.FileOffset}");
-                    }
-                    if (record.Size > 100 * 1024 * 1024) // 100MB Safety
-                    {
-                        // GD.PrintErr($"[ESMReader] CRITICAL: Record 0x{record.FormId:X8} has suspicious size {record.Size}. Skipping to prevent OOM.");
-                        return Array.Empty<byte>();
-                    }
+                    if (record.Size > 100 * 1024 * 1024) return Array.Empty<byte>();
                     byte[] data = _reader.ReadBytes((int)record.Size);
                     _stream.Position = currentPos;
                     return data;
                 }
                 catch (Exception e)
                 {
-                    // GD.PrintErr($"[ESMReader] CRITICAL ERROR reading 0x{record.FormId:X8} ({record.Type}) at {record.FileOffset}: {e.Message}");
                     throw;
                 }
             }
@@ -165,22 +177,14 @@ namespace OpenFo3.ESM
                 Array.Copy(data, 4, compressedData, 0, compressedData.Length);
                 try
                 {
-                    if (uncompressedSize > 50 * 1024 * 1024) // 50MB Safety
-                    {
-                        // GD.PrintErr($"[ESMReader] CRITICAL: Record 0x{record.FormId:X8} uncompressed size {uncompressedSize} is too large.");
-                        return subRecords;
-                    }
-
-                    // // GD.Print($"[ESMReader] Decompressing 0x{record.FormId:X8}: {data.Length} -> {uncompressedSize}");
                     using var ms = new MemoryStream(compressedData);
                     using var zs = new System.IO.Compression.ZLibStream(ms, System.IO.Compression.CompressionMode.Decompress);
                     using var decompressedMs = new MemoryStream();
                     zs.CopyTo(decompressedMs);
                     data = decompressedMs.ToArray();
                 }
-                catch (Exception e)
+                catch (Exception)
                 {
-                    // GD.PrintErr($"Failed to decompress record 0x{record.FormId:X8}: {e.Message}");
                     return subRecords;
                 }
             }
@@ -188,19 +192,26 @@ namespace OpenFo3.ESM
             using (var ms = new MemoryStream(data))
             using (var br = new BinaryReader(ms))
             {
+                uint? nextSizeOverride = null;
+
                 while (ms.Position < ms.Length)
                 {
                     if (ms.Length - ms.Position < 6) break;
                     string type = Encoding.ASCII.GetString(br.ReadBytes(4));
                     ushort size = br.ReadUInt16();
                     
-                    if (ms.Position + size > ms.Length)
+                    if (type == "XXXX")
                     {
-                        // GD.PrintErr($"[ESMReader] ERROR: SubRecord {type} size {size} exceeds record data length {ms.Length} at pos {ms.Position}");
-                        break;
+                        nextSizeOverride = br.ReadUInt32();
+                        continue;
                     }
 
-                    byte[] subData = br.ReadBytes(size);
+                    uint actualSize = nextSizeOverride ?? size;
+                    nextSizeOverride = null;
+
+                    if (ms.Position + actualSize > ms.Length) break;
+
+                    byte[] subData = br.ReadBytes((int)actualSize);
                     subRecords.Add(new SubRecord { Type = type, Data = subData });
                 }
             }

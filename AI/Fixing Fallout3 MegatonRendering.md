@@ -31,7 +31,4 @@ Progress Updates
 
 Diagnosing why most NiTriStripsData blocks have numVertices=0
 
-Analyzed
-Error
-Agent execution terminated due to error.
 ```
