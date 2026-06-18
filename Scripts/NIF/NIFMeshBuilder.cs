@@ -10,7 +10,7 @@ namespace OpenFo3.NIF
     /// </summary>
     public class NIFGeometryData
     {
-        public List<(Vector3[] Vertices, int[] Indices, Transform3D Transform)> Surfaces = new();
+        public List<(Vector3[] Vertices, Vector2[] UVs, int[] Indices, Transform3D Transform, string TexturePath)> Surfaces = new();
     }
 
     public static class NIFMeshBuilder
@@ -57,7 +57,24 @@ namespace OpenFo3.NIF
                 arrays[(int)Mesh.ArrayType.Vertex] = godotVertices;
                 arrays[(int)Mesh.ArrayType.Index] = surface.Indices;
 
+                if (surface.UVs != null && surface.UVs.Length == surface.Vertices.Length)
+                {
+                    arrays[(int)Mesh.ArrayType.TexUV] = surface.UVs;
+                }
+
                 mesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays);
+
+                // Store texture path in surface name
+                int surfaceIdx = mesh.GetSurfaceCount() - 1;
+                if (!string.IsNullOrEmpty(surface.TexturePath))
+                {
+                    GD.Print($"[NIFMeshBuilder] Setting surface {surfaceIdx} name to: '{surface.TexturePath}'");
+                    mesh.SurfaceSetName(surfaceIdx, surface.TexturePath);
+                }
+                else
+                {
+                    GD.Print($"[NIFMeshBuilder] Surface {surfaceIdx} has no texture path.");
+                }
             }
 
             return mesh;
@@ -77,7 +94,7 @@ namespace OpenFo3.NIF
             if (blockIdx < 0 || blockIdx >= nif.Blocks.Count) return;
             var block = nif.Blocks[blockIdx];
 
-            var node = NIFBlockResolver.Resolve(block);
+            var node = NIFBlockResolver.Resolve(block, nif);
             if (node == null) return;
 
             // Local transform
@@ -91,20 +108,21 @@ namespace OpenFo3.NIF
                 {
                     var dataBlock = nif.Blocks[node.DataIndex];
                     Vector3[] verts = null;
+                    Vector2[] uvs = null;
                     int[] inds = null;
 
                     if (dataBlock.Type == "NiTriStripsData")
                     {
-                        (verts, inds) = NiTriStripsDataParser.Parse(dataBlock.Data);
+                        (verts, uvs, inds) = NiTriStripsDataParser.Parse(dataBlock.Data);
                     }
                     else if (dataBlock.Type == "NiTriShapeData")
                     {
-                        (verts, inds) = NiTriShapeDataParser.Parse(dataBlock.Data);
+                        (verts, uvs, inds) = NiTriShapeDataParser.Parse(dataBlock.Data);
                     }
 
                     if (verts != null && inds != null && inds.Length >= 3)
                     {
-                        geom.Surfaces.Add((verts, inds, globalTransform));
+                        geom.Surfaces.Add((verts, uvs, inds, globalTransform, node.TexturePath));
                     }
                 }
             }

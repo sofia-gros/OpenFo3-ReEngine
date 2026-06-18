@@ -8,25 +8,28 @@ using System.Collections.Concurrent;
 using System.Threading.Tasks;
 using OpenFo3.ESM;
 using OpenFo3.NIF;
+using OpenFo3.BSA;
 
 public partial class Megaton : Node3D
 {
 	private ConcurrentDictionary<string, ArrayMesh> _meshCache = new();
 	private ConcurrentDictionary<string, NIFReader> _nifCache = new();
-	private OpenFo3.BSA.BSAReader _bsa;
+	private ConcurrentDictionary<string, Texture2D> _textureCache = new();
+	
+	private BSAReader _meshesBsa;
+	private BSAReader _texturesBsa;
 	private ESMReader _esm;
 
 	private Dictionary<uint, RecordEntry> _masterFormIDIndex;
 	private Dictionary<uint, RecordEntry> _refrFormIDIndex;
-	private List<OpenFo3.BSA.BSAFile> _bsaFiles;
+	private List<BSAFile> _meshFiles;
+	private List<BSAFile> _textureFiles;
 
 	private const int MaxObjectsToLoad = 5000;
-	private const float CellSize = 8192.0f;
 	private const float WorldScale = 0.015f;
 
 	private ConcurrentQueue<InstanceRequest> _instantiateQueue = new();
 	private Vector2 _megatonCenter = new Vector2(-14200f, -3800f);
-	private float _loadRadius = 120000f;
 
 	private struct InstanceRequest
 	{
@@ -37,8 +40,7 @@ public partial class Megaton : Node3D
 
 	public override void _Process(double delta)
 	{
-		// Drain the instantiate queue (max N per frame to avoid stalls)
-		const int MaxPerFrame = 200;
+		const int MaxPerFrame = 100;
 		for (int i = 0; i < MaxPerFrame && _instantiateQueue.TryDequeue(out var req); i++)
 		{
 			CreateAndAddInstance(req);
@@ -51,9 +53,17 @@ public partial class Megaton : Node3D
 
 		try
 		{
-			string bsaPath = Path.Combine(GamePaths.DataPath, "Fallout - Meshes.bsa");
-			_bsa = new OpenFo3.BSA.BSAReader(bsaPath);
-			_bsaFiles = _bsa.ExtractFileList();
+			string meshesBsaPath = Path.Combine(GamePaths.DataPath, "Fallout - Meshes.bsa");
+			_meshesBsa = new BSAReader(meshesBsaPath);
+			_meshFiles = _meshesBsa.ExtractFileList();
+
+			string texturesBsaPath = Path.Combine(GamePaths.DataPath, "Fallout - Textures.bsa");
+			if (File.Exists(texturesBsaPath))
+			{
+				_texturesBsa = new BSAReader(texturesBsaPath);
+				_textureFiles = _texturesBsa.ExtractFileList();
+				GD.Print($"[Megaton] Loaded Textures BSA: {_textureFiles.Count} files.");
+			}
 
 			_esm = new ESMReader(GamePaths.EsmPath);
 			_masterFormIDIndex = _esm.BuildFormIdIndex(new[]
@@ -64,7 +74,6 @@ public partial class Megaton : Node3D
 
 			_refrFormIDIndex = _esm.BuildFormIdIndex(new[] { "REFR" });
 
-			// 1. Find Megaton Worldspace
 			uint megatonWorldId = 0;
 			var wrldIndex = _esm.BuildFormIdIndex(new[] { "WRLD" });
 			foreach (var kvp in wrldIndex)
@@ -84,10 +93,10 @@ public partial class Megaton : Node3D
 				}
 			}
 
-			if (megatonWorldId == 0) GD.PrintErr("[Megaton] Could not find MegatonWorld worldspace!");
-
-			// Start background loading
-			_ = Task.Run(() => LoadWorldAsync(megatonWorldId));
+			if (megatonWorldId != 0)
+			{
+				_ = Task.Run(() => LoadWorldAsync(megatonWorldId));
+			}
 		}
 		catch (Exception e)
 		{
@@ -97,70 +106,24 @@ public partial class Megaton : Node3D
 
 	private async Task LoadWorldAsync(uint targetWorldId)
 	{
-		// 1. Group by Chunks
-		var chunks = new Dictionary<Vector2I, List<long>>();
-		int totalRefrs = 0;
+		var refrsToProcess = new List<long>();
 		foreach (var kvp in _refrFormIDIndex)
 		{
-			var entry = kvp.Value;
-
-			if (entry.WorldFormId != targetWorldId) continue;
-
-			var offset = entry.Offset;
-			ESMRecord record;
-			List<SubRecord> subs;
-
-			lock (_esm)
-			{
-				record = _esm.GetRecordAtOffset(offset);
-				subs = _esm.GetSubRecords(record);
-			}
-
-			var dataSub = subs.FirstOrDefault(s => s.Type == "DATA");
-			if (dataSub == null) continue;
-
-			float px = BitConverter.ToSingle(dataSub.Data, 0);
-			float py = BitConverter.ToSingle(dataSub.Data, 4);
-
-			var chunkCoords = Vector2I.Zero;
-			if (!chunks.ContainsKey(chunkCoords)) chunks[chunkCoords] = new List<long>();
-			chunks[chunkCoords].Add(offset);
-
-			totalRefrs++;
+			if (kvp.Value.WorldFormId == targetWorldId)
+				refrsToProcess.Add(kvp.Value.Offset);
 		}
 
-		GD.Print($"[Megaton] Found {totalRefrs} REFRs in Megaton hierarchy.");
+		GD.Print($"[Megaton] Found {refrsToProcess.Count} REFRs in Megaton hierarchy.");
 
-		// 2. Process Chunks (Parallel NIF Parsing — no Godot API calls)
 		await Task.Run(() =>
 		{
-			Parallel.ForEach(chunks, chunkKvp =>
+			Parallel.ForEach(refrsToProcess, offset =>
 			{
-				foreach (var offset in chunkKvp.Value)
-				{
-					ProcessRecord(offset);
-				}
+				ProcessRecord(offset);
 			});
 		});
 
-		GD.Print($"[Megaton] Parsing done. Queue: {_instantiateQueue.Count}, NIFCache: {_nifCache.Count}, MeshCache: {_meshCache.Count}");
-		// Give _Process time to drain the queue and build meshes
-		await ToSignal(GetTree().CreateTimer(3.0), SceneTreeTimer.SignalName.Timeout);
-		GD.Print($"[Megaton] Scene children: {GetChildCount()} (after 3s drain)");
-
-		var positions = new List<Vector3>();
-		for (int i = 0; i < GetChildCount(); i++)
-			if (GetChild(i) is Node3D n3d) positions.Add(n3d.GlobalPosition);
-		if (positions.Count > 0)
-		{
-			var minP = positions[0]; var maxP = positions[0];
-			foreach (var p in positions)
-			{
-				minP = new Vector3(Math.Min(minP.X, p.X), Math.Min(minP.Y, p.Y), Math.Min(minP.Z, p.Z));
-				maxP = new Vector3(Math.Max(maxP.X, p.X), Math.Max(maxP.Y, p.Y), Math.Max(maxP.Z, p.Z));
-			}
-			GD.Print($"[Megaton] Position range: {minP} to {maxP}");
-		}
+		GD.Print($"[Megaton] Parsing done. Queue: {_instantiateQueue.Count}");
 	}
 
 	private void ProcessRecord(long offset)
@@ -197,7 +160,6 @@ public partial class Megaton : Node3D
 
 			if (!nifPath.StartsWith("meshes/", StringComparison.OrdinalIgnoreCase)) nifPath = "meshes/" + nifPath;
 
-			// Ensure NIF is parsed and cached (worker thread)
 			EnsureNifParsed(nifPath);
 
 			float px = BitConverter.ToSingle(dataSub.Data, 0);
@@ -220,18 +182,14 @@ public partial class Megaton : Node3D
 		}
 	}
 
-	/// <summary>
-	/// Parse NIF on worker thread and cache the NIFReader.
-	/// No Godot API calls here (thread-safe).
-	/// </summary>
 	private void EnsureNifParsed(string path)
 	{
 		if (_nifCache.ContainsKey(path)) return;
 
-		var file = _bsaFiles.FirstOrDefault(f => f.Path.Equals(path, StringComparison.OrdinalIgnoreCase));
+		var file = _meshFiles.FirstOrDefault(f => f.Path.Equals(path, StringComparison.OrdinalIgnoreCase));
 		if (file == null) return;
 
-		byte[] nifData = _bsa.ReadFileData(file);
+		byte[] nifData = _meshesBsa.ReadFileData(file);
 		if (nifData == null) return;
 
 		var nif = new NIFReader();
@@ -245,13 +203,11 @@ public partial class Megaton : Node3D
 
 	private void CreateAndAddInstance(InstanceRequest req)
 	{
-		// Build or retrieve mesh on main thread
 		var mesh = GetOrBuildMesh(req.Path);
 		if (mesh == null) return;
 
 		var inst = new MeshInstance3D { Mesh = mesh };
 
-		// FO3 stores rotations in RADIANS (not degrees)
 		var basis = Basis.Identity;
 		basis = basis.Rotated(Vector3.Up, req.Rotation.Z);
 		basis = basis.Rotated(Vector3.Right, req.Rotation.X);
@@ -261,28 +217,91 @@ public partial class Megaton : Node3D
 		AddChild(inst);
 	}
 
-	/// <summary>
-	/// Build ArrayMesh from cached NIFReader on the main thread.
-	/// Thread-safe: only called from _Process → CreateAndAddInstance.
-	/// </summary>
 	private ArrayMesh GetOrBuildMesh(string path)
 	{
 		if (_meshCache.TryGetValue(path, out var cached)) return cached;
 
 		if (!_nifCache.TryGetValue(path, out var nif)) return null;
 
-		// Extract geometry (pure data, no Godot API — safe but not needed to be on worker)
 		var geom = NIFMeshBuilder.ExtractGeometry(nif);
 		if (geom.Surfaces.Count == 0) return null;
 
-		// Build ArrayMesh (MUST be on main thread)
 		var mesh = NIFMeshBuilder.BuildArrayMesh(geom);
 		if (mesh.GetSurfaceCount() > 0)
 		{
+			// Apply textures
+			for (int i = 0; i < mesh.GetSurfaceCount(); i++)
+			{
+				string texPath = mesh.SurfaceGetName(i);
+				GD.Print($"[Megaton] Surface {i} of {path} has TexturePath: '{texPath}'");
+				
+				if (!string.IsNullOrEmpty(texPath))
+				{
+					var tex = LoadTexture(texPath);
+					if (tex != null)
+					{
+						var mat = new StandardMaterial3D { AlbedoTexture = tex };
+						mesh.SurfaceSetMaterial(i, mat);
+					}
+					else
+					{
+						GD.Print($"[Megaton] Texture NOT found/loaded: {texPath} for mesh {path}");
+					}
+				}
+			}
+
 			_meshCache.TryAdd(path, mesh);
 			return mesh;
 		}
 
 		return null;
+	}
+
+	private Texture2D LoadTexture(string path)
+	{
+		path = path.Replace('\\', '/');
+		
+		// Some NIFs have "textures/" prefix, some don't. 
+		// Let's try matching both or normalization.
+		string searchPath = path;
+		if (!searchPath.StartsWith("textures/", StringComparison.OrdinalIgnoreCase))
+			searchPath = "textures/" + searchPath;
+
+		if (_textureCache.TryGetValue(searchPath, out var cached)) return cached;
+
+		if (_texturesBsa == null) return null;
+
+		var file = _textureFiles.FirstOrDefault(f => f.Path.Equals(searchPath, StringComparison.OrdinalIgnoreCase));
+		
+		// If not found with "textures/", try without it just in case
+		if (file == null && searchPath.StartsWith("textures/", StringComparison.OrdinalIgnoreCase))
+		{
+			string altPath = searchPath.Substring(9);
+			file = _textureFiles.FirstOrDefault(f => f.Path.Equals(altPath, StringComparison.OrdinalIgnoreCase));
+		}
+
+		if (file == null)
+		{
+			// GD.PrintErr($"[Megaton] Texture file not in BSA: {searchPath}");
+			return null;
+		}
+
+		byte[] data = _texturesBsa.ReadFileData(file);
+		if (data == null) return null;
+
+		var img = new Image();
+		Error err = img.LoadDdsFromBuffer(data);
+		if (err == Error.Ok)
+		{
+			var tex = ImageTexture.CreateFromImage(img);
+			_textureCache.TryAdd(searchPath, tex);
+			GD.Print($"[Megaton] Successfully loaded texture: {searchPath}");
+			return tex;
+		}
+		else
+		{
+			GD.PrintErr($"[Megaton] Failed to load DDS texture: {searchPath} (Error: {err})");
+			return null;
+		}
 	}
 }

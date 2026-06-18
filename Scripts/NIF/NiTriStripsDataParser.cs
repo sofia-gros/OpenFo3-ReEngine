@@ -26,7 +26,7 @@ namespace OpenFo3.NIF
     /// </summary>
     public static class NiTriStripsDataParser
     {
-        public static (Vector3[] Vertices, int[] Indices) Parse(byte[] data)
+        public static (Vector3[] Vertices, Vector2[] UVs, int[] Indices) Parse(byte[] data)
         {
             try
             {
@@ -67,7 +67,12 @@ namespace OpenFo3.NIF
                 if (hasVertexColors) ms.Seek(numVertices * 16, SeekOrigin.Current);
 
                 // UV Sets: present when BS Data Flags bit0 set; one set (2 floats/vert)
-                if (hasUV) ms.Seek(numVertices * 8, SeekOrigin.Current);
+                Vector2[] uvs = new Vector2[numVertices];
+                if (hasUV)
+                {
+                    for (int i = 0; i < numVertices; i++)
+                        uvs[i] = new Vector2(br.ReadSingle(), br.ReadSingle());
+                }
 
                 // End of NiGeometryData
                 br.ReadUInt16();  // Consistency Flags
@@ -108,19 +113,19 @@ namespace OpenFo3.NIF
                         }
                     }
                 }
-                return (vertices, indicesList.ToArray());
+                return (vertices, uvs, indicesList.ToArray());
             }
             catch (Exception e)
             {
                 GD.PrintErr($"[NiTriStripsDataParser] Parse failed: {e.Message}");
-                return (new Vector3[0], new int[0]);
+                return (new Vector3[0], new Vector2[0], new int[0]);
             }
         }
     }
 
     public static class NiTriShapeDataParser
     {
-        public static (Vector3[] Vertices, int[] Indices) Parse(byte[] data)
+        public static (Vector3[] Vertices, Vector2[] UVs, int[] Indices) Parse(byte[] data)
         {
             try
             {
@@ -152,7 +157,13 @@ namespace OpenFo3.NIF
 
                 bool hasVertexColors = br.ReadByte() != 0;
                 if (hasVertexColors) ms.Seek(numVertices * 16, SeekOrigin.Current);
-                if (hasUV) ms.Seek(numVertices * 8, SeekOrigin.Current);
+
+                Vector2[] uvs = new Vector2[numVertices];
+                if (hasUV)
+                {
+                    for (int i = 0; i < numVertices; i++)
+                        uvs[i] = new Vector2(br.ReadSingle(), br.ReadSingle());
+                }
 
                 br.ReadUInt16();  // Consistency Flags
                 br.ReadInt32();   // Additional Data (Ref)
@@ -171,14 +182,14 @@ namespace OpenFo3.NIF
                         ushort idx = br.ReadUInt16();
                         indices[i] = (idx < numVertices) ? idx : 0; // OOB guard
                     }
-                    return (vertices, indices);
+                    return (vertices, uvs, indices);
                 }
-                return (vertices, new int[0]);
+                return (vertices, uvs, new int[0]);
             }
             catch (Exception e)
             {
                 GD.PrintErr($"[NiTriShapeDataParser] Parse failed: {e.Message}");
-                return (new Vector3[0], new int[0]);
+                return (new Vector3[0], new Vector2[0], new int[0]);
             }
         }
     }

@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Text;
 using Godot;
 
 namespace OpenFo3.NIF
@@ -15,9 +17,11 @@ namespace OpenFo3.NIF
             public float Scale;
             public List<int> Children = new();
             public int DataIndex = -1;
+            public List<int> PropertyIndices = new();
+            public string TexturePath; // Primary diffuse texture
         }
 
-        public static Node Resolve(NIFBlock block)
+        public static Node Resolve(NIFBlock block, NIFReader nif)
         {
             try
             {
@@ -30,7 +34,12 @@ namespace OpenFo3.NIF
                 }
                 else if (block.Type == "NiTriShape" || block.Type == "NiTriStrips")
                 {
-                    return ParseNode(br, block.Index, block.Type, isGeometry: true);
+                    var node = ParseNode(br, block.Index, block.Type, isGeometry: true);
+                    if (node != null)
+                    {
+                        node.TexturePath = ResolveTexturePath(node, nif);
+                    }
+                    return node;
                 }
             }
             catch (Exception e)
@@ -41,40 +50,111 @@ namespace OpenFo3.NIF
             return null;
         }
 
-        /// <summary>
-        /// Parse NiNode/NiAVObject fields for FO3 NIF version 20.2.0.7.
-        /// Verified layout (PyFFI ground truth + binary remainder=0):
-        ///
-        /// NiObjectNET:
-        ///   Name         uint32  (index into string table)
-        ///   NumExtraData uint32
-        ///   ExtraData[]  int32 * NumExtraData  (block refs)
-        ///   Controller   int32  (block ref)
-        ///
-        /// NiAVObject:
-        ///   Flags             uint32
-        ///   Translation       float, float, float
-        ///   Rotation          9 × float (Matrix33, row-major)
-        ///   Scale             float
-        ///   NumProperties     uint32
-        ///   Properties[]      int32 * NumProperties  (block refs)
-        ///   CollisionObject   int32  (block ref)
-        ///
-        /// NiNode (if not geometry):
-        ///   NumChildren   uint32
-        ///   Children[]    int32 * NumChildren  (block refs)
-        ///   NumEffects    uint32
-        ///   Effects[]     int32 * NumEffects   (block refs)
-        ///
-        /// NiGeometry (if geometry):
-        ///   Data            int32  (block ref)
-        ///   SkinInstance    int32  (block ref)
-        ///   NumMaterials    uint32
-        ///   MaterialName[]  int32 * NumMaterials  (block refs)
-        ///   MaterialExtra[] int32 * NumMaterials  (block refs)
-        ///   ActiveMaterial  uint32
-        ///   MaterialNeedsUpdate byte  (FO3 bool = 1 byte)
-        /// </summary>
+        private static string ResolveTexturePath(Node node, NIFReader nif)
+        {
+            if (node.PropertyIndices.Count == 0) return null;
+
+            foreach (int propIdx in node.PropertyIndices)
+            {
+                if (propIdx < 0 || propIdx >= nif.Blocks.Count) continue;
+                var propBlock = nif.Blocks[propIdx];
+
+                if (propBlock.Type == "BSShaderPPLightingProperty" || propBlock.Type == "BSShaderNoLightingProperty")
+                {
+                    try
+                    {
+                        using var ms = new MemoryStream(propBlock.Data);
+                        using var br = new BinaryReader(ms);
+
+                        // --- NiObjectNET fields ---
+                        br.ReadUInt32(); // Name index
+                        uint numExtra = br.ReadUInt32();
+                        for (int i = 0; i < numExtra; i++) br.ReadInt32();
+                        br.ReadInt32(); // Controller
+
+                        // --- BSShaderProperty fields (Fixed offset from dump) ---
+                        // Dump: FF-FF-FF-FF-00-00-00-00-FF-FF-FF-FF-01-00-01-00-00-00-01-01-00-82-01-00-00-00-00-00-80-3F-03-00-00-00-11-00-00-00
+                        br.ReadBytes(18); // Header/Flags adjustment
+                        
+                        uint shaderType = br.ReadUInt32();
+                        int textureSetRef = br.ReadInt32();
+
+                        if (textureSetRef != -1 && textureSetRef < nif.Blocks.Count)
+                        {
+                            var tsBlock = nif.Blocks[textureSetRef];
+                            if (tsBlock.Type == "BSShaderTextureSet")
+                            {
+                                using var msTS = new MemoryStream(tsBlock.Data);
+                                using var brTS = new BinaryReader(msTS);
+                                uint numTextures = brTS.ReadUInt32();
+                                if (numTextures > 0 && numTextures < 20)
+                                {
+                                    string texPath = ReadNifString(brTS);
+                                    if (!string.IsNullOrEmpty(texPath)) return texPath;
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        GD.PrintErr($"[NIFBlockResolver] Failed to parse shader property {propBlock.Type}: {ex.Message}");
+                    }
+                }
+                else if (propBlock.Type == "NiTexturingProperty")
+                {
+                    try
+                    {
+                        using var ms = new MemoryStream(propBlock.Data);
+                        using var br = new BinaryReader(ms);
+                        
+                        br.ReadUInt32(); 
+                        uint numExtra = br.ReadUInt32();
+                        for (int i = 0; i < numExtra; i++) br.ReadInt32();
+                        br.ReadInt32(); 
+
+                        br.ReadUInt16(); // Flags
+                        br.ReadUInt16(); // ApplyMode
+                        ushort texCount = br.ReadUInt16(); 
+                        
+                        for (int i = 0; i < texCount; i++)
+                        {
+                            bool enabled = br.ReadByte() != 0;
+                            int texRef = br.ReadInt32();
+                            
+                            if (enabled && texRef != -1 && texRef < nif.Blocks.Count)
+                            {
+                                var srcBlock = nif.Blocks[texRef];
+                                if (srcBlock.Type == "NiSourceTexture")
+                                {
+                                    using var msST = new MemoryStream(srcBlock.Data);
+                                    using var brST = new BinaryReader(msST);
+                                    
+                                    brST.ReadUInt32(); uint stNumExtra = brST.ReadUInt32();
+                                    for(int j=0; j<stNumExtra; j++) brST.ReadInt32();
+                                    brST.ReadInt32();
+                                    
+                                    string path = ReadNifString(brST);
+                                    if (!string.IsNullOrEmpty(path)) return path;
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex) { GD.PrintErr($"[NIFBlockResolver] Failed to parse NiTexturingProperty: {ex.Message}"); }
+                }
+            }
+            return null;
+        }
+
+        private static string ReadNifString(BinaryReader br)
+        {
+            if (br.BaseStream.Position + 4 > br.BaseStream.Length) return null;
+            uint len = br.ReadUInt32();
+            if (len == 0 || len > 512) return null;
+            if (br.BaseStream.Position + len > br.BaseStream.Length) return null;
+            byte[] bytes = br.ReadBytes((int)len);
+            return Encoding.ASCII.GetString(bytes).TrimEnd('\0');
+        }
+
         private static Node ParseNode(BinaryReader br, int blockIdx, string blockType, bool isGeometry = false)
         {
             var node = new Node();
@@ -92,7 +172,7 @@ namespace OpenFo3.NIF
 
             node.Translation = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
 
-            // Rotation Matrix (3x3, row-major: m11 m12 m13 m21 m22 m23 m31 m32 m33)
+            // Rotation Matrix (3x3, row-major)
             float m11 = br.ReadSingle(), m12 = br.ReadSingle(), m13 = br.ReadSingle();
             float m21 = br.ReadSingle(), m22 = br.ReadSingle(), m23 = br.ReadSingle();
             float m31 = br.ReadSingle(), m32 = br.ReadSingle(), m33 = br.ReadSingle();
@@ -105,23 +185,28 @@ namespace OpenFo3.NIF
             node.Scale = br.ReadSingle();
 
             uint numProps = br.ReadUInt32();
-            for (int i = 0; i < numProps; i++) br.ReadInt32();
+            
+            for (int i = 0; i < numProps; i++)
+            {
+                int propIdx = br.ReadInt32();
+                if (propIdx != -1) node.PropertyIndices.Add(propIdx);
+            }
 
             int collisionObject = br.ReadInt32();
 
             // 3. NiNode or NiGeometry fields
             if (isGeometry)
             {
-                node.DataIndex = br.ReadInt32(); // Data Ref
+                node.DataIndex = br.ReadInt32();
 
                 br.ReadInt32(); // Skin Instance Ref
 
                 uint numMaterials = br.ReadUInt32();
-                for (int i = 0; i < numMaterials; i++) br.ReadInt32(); // Material Name refs
-                for (int i = 0; i < numMaterials; i++) br.ReadInt32(); // Material Extra Data refs
+                for (int i = 0; i < numMaterials; i++) br.ReadInt32();
+                for (int i = 0; i < numMaterials; i++) br.ReadInt32();
 
-                /* uint activeMaterial = */ br.ReadUInt32();
-                br.ReadByte(); // Material Needs Update (bool, 1 byte for FO3)
+                br.ReadUInt32(); // Active Material
+                br.ReadByte();   // Material Needs Update
             }
             else
             {

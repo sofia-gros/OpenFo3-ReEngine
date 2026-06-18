@@ -10,6 +10,7 @@ namespace OpenFo3.NIF
     {
         public List<NIFBlock> Blocks = new List<NIFBlock>();
         public List<int> RootBlockIndices = new List<int>();
+        public List<string> Strings = new List<string>();
 
         public void Parse(byte[] data)
         {
@@ -67,7 +68,7 @@ namespace OpenFo3.NIF
                     for (int i = 0; i < numStrings; i++)
                     {
                         uint len = br.ReadUInt32();
-                        br.ReadBytes((int)len);
+                        Strings.Add(Encoding.ASCII.GetString(br.ReadBytes((int)len)).TrimEnd('\0'));
                     }
                 }
 
