@@ -70,7 +70,8 @@ public partial class Megaton : Node3D
 			{
 				"STAT", "DOOR", "FURN", "ACTI", "MSTT", "LIGH", "TERM",
 				"CONT", "MISC", "WEAP", "ARMO", "CLOT", "TREE", "ALCH", "INGR", "BOOK",
-				"NPC_", "CREA", "GRAS", "LAND", "DEBR", "SCOL"
+				// "NPC_", "CREA",
+				"GRAS", "LAND", "DEBR", "SCOL"
 			});
 
 			_refrFormIDIndex = _esm.BuildFormIdIndex(new[] { "REFR" });
