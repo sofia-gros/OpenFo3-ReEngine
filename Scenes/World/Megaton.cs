@@ -84,6 +84,9 @@ public partial class Megaton : Node3D
 			_lightingLoader = new LightingLoader(_esm);
 			_terrainBuilder = new TerrainBuilder(_esm);
 
+			float defaultLandHeight = 0;
+			int nwCellX = 0, nwCellY = 0, seCellX = 0, seCellY = 0;
+
 			uint megatonWorldId = 0;
 			var wrldIndex = _esm.BuildFormIdIndex(new[] { "WRLD" });
 			foreach (var kvp in wrldIndex)
@@ -98,6 +101,24 @@ public partial class Megaton : Node3D
 					{
 						megatonWorldId = rec.FormId;
 						GD.Print($"[Megaton] Found MegatonWorld: 0x{megatonWorldId:X8}");
+
+						var dnam = subs.FirstOrDefault(s => s.Type == "DNAM");
+						if (dnam != null && dnam.Data.Length >= 8)
+						{
+							defaultLandHeight = BitConverter.ToSingle(dnam.Data, 0);
+							GD.Print($"[Megaton] MegatonWorld Default Land Height = {defaultLandHeight}");
+						}
+
+						var mnam = subs.FirstOrDefault(s => s.Type == "MNAM");
+						if (mnam != null && mnam.Data.Length >= 16)
+						{
+							nwCellX = BitConverter.ToInt16(mnam.Data, 8);
+							nwCellY = BitConverter.ToInt16(mnam.Data, 10);
+							seCellX = BitConverter.ToInt16(mnam.Data, 12);
+							seCellY = BitConverter.ToInt16(mnam.Data, 14);
+						}
+						GD.Print($"[Megaton] MegatonWorld bounds: NW=({nwCellX},{nwCellY}) SE=({seCellX},{seCellY})");
+
 						break;
 					}
 				}
@@ -108,7 +129,7 @@ public partial class Megaton : Node3D
 				_megatonWorldId = megatonWorldId;
 
 				// Load terrain synchronously before async world load
-				LoadTerrain(megatonWorldId);
+				LoadTerrain(megatonWorldId, defaultLandHeight, nwCellX, nwCellY, seCellX, seCellY);
 
 				// Load cell lighting
 				LoadCellLighting(megatonWorldId);
@@ -122,11 +143,13 @@ public partial class Megaton : Node3D
 		}
 	}
 
-	private void LoadTerrain(uint worldId)
+	private void LoadTerrain(uint worldId, float defaultLandHeight,
+		int nwCellX, int nwCellY, int seCellX, int seCellY)
 	{
 		try
 		{
-			var tiles = _terrainBuilder.BuildTerrainForWorld(worldId, _megatonCenter, LoadTexture);
+			var tiles = _terrainBuilder.BuildTerrainForWorld(worldId, _megatonCenter, LoadTexture,
+				defaultLandHeight, nwCellX, nwCellY, seCellX, seCellY);
 			GD.Print($"[Megaton] Loaded {tiles.Count} terrain tiles.");
 
 			foreach (var tile in tiles)
