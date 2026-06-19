@@ -359,6 +359,11 @@ public partial class Megaton : Node3D
 						}
 					}
 
+					// RenderPriority forces consistent draw order matching NIF hierarchy,
+					// preventing z-fighting between overlapping sibling meshes
+					// (e.g. refrigerator body and door, table and drawers).
+					mat.RenderPriority = i;
+
 					mesh.SurfaceSetMaterial(i, mat);
 				}
 				else if (!string.IsNullOrEmpty(texPath))
@@ -367,6 +372,7 @@ public partial class Megaton : Node3D
 					if (tex != null)
 					{
 						var mat = new StandardMaterial3D { AlbedoTexture = tex };
+						mat.RenderPriority = i;
 						mesh.SurfaceSetMaterial(i, mat);
 					}
 				}
