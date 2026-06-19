@@ -5,7 +5,6 @@ namespace OpenFo3.NIF
 {
     public static class NIFMaterialBuilder
     {
-        // FO3 BSShaderTextureSet slot indices
         private const int SlotDiffuse = 0;
         private const int SlotNormalGloss = 1;
         private const int SlotGlowSkinHair = 2;
@@ -23,6 +22,8 @@ namespace OpenFo3.NIF
             if (shader == null)
             {
                 mat.AlbedoColor = new Color(0.8f, 0.8f, 0.8f);
+                mat.Roughness = 0.8f;
+                mat.Metallic = 0.0f;
                 return mat;
             }
 
@@ -50,8 +51,6 @@ namespace OpenFo3.NIF
             }
             else if ((shader.ShaderFlags & 0x00000100) != 0)
             {
-                // No NiAlphaProperty, but ShaderFlags bit 8 (AlphaTexture) is set.
-                // Only enable alpha if the diffuse texture actually has transparent pixels.
                 bool diffuseHasAlpha = false;
                 if (textureHasAlpha != null && texPaths != null && texPaths.Length > SlotDiffuse && !string.IsNullOrEmpty(texPaths[SlotDiffuse]))
                 {
@@ -70,13 +69,26 @@ namespace OpenFo3.NIF
                 mat.VertexColorUseAsAlbedo = true;
             }
 
+            mat.Roughness = 0.6f;
+            mat.Metallic = 0.0f;
+
             if ((shader.ShaderFlags & 0x00000001) != 0)
             {
                 mat.SpecularMode = BaseMaterial3D.SpecularModeEnum.SchlickGgx;
-                mat.Metallic = 0.0f;
+            }
+            else
+            {
+                mat.SpecularMode = BaseMaterial3D.SpecularModeEnum.Disabled;
             }
 
-            // --- Diffuse / Albedo (Slot 0) ---
+            // Rough metallic surfaces (e.g., rusted metal)
+            if ((shader.ShaderFlags & (1 << 7)) != 0)
+            {
+                mat.Metallic = 0.3f;
+                mat.Roughness = 0.5f;
+            }
+
+            // ---- Diffuse / Albedo (Slot 0) ----
             if (texPaths != null && texPaths.Length > SlotDiffuse && !string.IsNullOrEmpty(texPaths[SlotDiffuse]))
             {
                 var tex = loadTexture(texPaths[SlotDiffuse]);
@@ -86,7 +98,7 @@ namespace OpenFo3.NIF
                 }
             }
 
-            // --- Normal Map (Slot 1, with gloss in alpha) ---
+            // ---- Normal Map (Slot 1) ----
             if (texPaths != null && texPaths.Length > SlotNormalGloss && !string.IsNullOrEmpty(texPaths[SlotNormalGloss]))
             {
                 var tex = loadTexture(texPaths[SlotNormalGloss]);
@@ -94,44 +106,37 @@ namespace OpenFo3.NIF
                 {
                     mat.NormalTexture = tex;
                     mat.NormalEnabled = true;
-
-                    // FO3 packs gloss in normal map alpha; we use it as roughness
-                    mat.RoughnessTexture = tex;
-                    mat.RoughnessTextureChannel = BaseMaterial3D.TextureChannel.Alpha;
                 }
             }
 
-            // --- Environment Map (Slot 4) ---
+            // ---- Roughness from Environment Mask (Slot 5) ----
+            // FO3 stores specular intensity / gloss in the environment mask (Slot 5).
+            // We use its red channel as a roughness map.
+            if (texPaths != null && texPaths.Length > SlotEnvironmentMask && !string.IsNullOrEmpty(texPaths[SlotEnvironmentMask]))
+            {
+                var tex = loadTexture(texPaths[SlotEnvironmentMask]);
+                if (tex != null)
+                {
+                    mat.RoughnessTexture = tex;
+                    mat.RoughnessTextureChannel = BaseMaterial3D.TextureChannel.Red;
+                }
+            }
 
-            // --- Environment Map (Slot 4) ---
+            // ---- Environment Map (Slot 4) ----
             if (texPaths != null && texPaths.Length > SlotEnvironment && !string.IsNullOrEmpty(texPaths[SlotEnvironment]))
             {
                 var tex = loadTexture(texPaths[SlotEnvironment]);
                 if (tex != null)
                 {
-                    // Godot doesn't directly support environment map textures on StandardMaterial3D,
-                    // but we can use it as a metallic/roughness hint
                     mat.MetallicTexture = tex;
                     mat.MetallicTextureChannel = BaseMaterial3D.TextureChannel.Red;
                 }
             }
 
-            if ((shader.ShaderFlags & (1 << 7)) != 0)
-            {
-                mat.Metallic = 0.3f;
-                mat.Roughness = 0.4f;
-            }
-
-            // --- Emissive / Glow (Slot 2, Slot 3) ---
-            string glowPath = null;
+            // ---- Emissive / Glow (Slot 2) ----
             if (texPaths != null && texPaths.Length > SlotGlowSkinHair && !string.IsNullOrEmpty(texPaths[SlotGlowSkinHair]))
             {
-                glowPath = texPaths[SlotGlowSkinHair];
-            }
-
-            if (!string.IsNullOrEmpty(glowPath))
-            {
-                var tex = loadTexture(glowPath);
+                var tex = loadTexture(texPaths[SlotGlowSkinHair]);
                 if (tex != null)
                 {
                     mat.EmissionTexture = tex;
@@ -140,7 +145,7 @@ namespace OpenFo3.NIF
                 }
             }
 
-            // --- Heightmap / Parallax (Slot 3) ---
+            // ---- Heightmap / Parallax (Slot 3) ----
             if (texPaths != null && texPaths.Length > SlotHeightParallax && !string.IsNullOrEmpty(texPaths[SlotHeightParallax]))
             {
                 var tex = loadTexture(texPaths[SlotHeightParallax]);
@@ -153,7 +158,7 @@ namespace OpenFo3.NIF
                 }
             }
 
-            // --- Detail Map (multi-layer parallax subsurface slot 6, or use as detail) ---
+            // ---- Detail Map (Slot 6) ----
             if (texPaths != null && texPaths.Length > SlotSubsurface && !string.IsNullOrEmpty(texPaths[SlotSubsurface]))
             {
                 var tex = loadTexture(texPaths[SlotSubsurface]);
@@ -164,7 +169,7 @@ namespace OpenFo3.NIF
                 }
             }
 
-            // --- Refraction ---
+            // ---- Refraction ----
             if ((shader.ShaderFlags & (1 << 15)) != 0 || (shader.ShaderFlags & (1 << 16)) != 0)
             {
                 mat.RefractionEnabled = true;
