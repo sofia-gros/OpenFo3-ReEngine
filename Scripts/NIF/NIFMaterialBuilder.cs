@@ -14,6 +14,27 @@ namespace OpenFo3.NIF
         private const int SlotSubsurface = 6;
         private const int SlotBackLighting = 7;
 
+        // FO3 BSShaderProperty shader types
+        private const int ShaderTypeDefault = 0;
+        private const int ShaderTypeDefaultAlt = 1;
+        private const int ShaderTypeEnvironmentMap = 2;
+        private const int ShaderTypeGlowShader = 3;
+        private const int ShaderTypeHeightmap = 4;
+        private const int ShaderTypeZBufferWrite = 5;
+        private const int ShaderTypeLODLandscape = 6;
+        private const int ShaderTypeLODBuilding = 7;
+        private const int ShaderTypeMultiLayerParallax = 10;
+        private const int ShaderTypeParallaxOcc = 11;
+        private const int ShaderTypeSnowShader = 14;
+        private const int ShaderTypeMultiLayerParallaxOcc = 15;
+        private const int ShaderTypeEnvironmentMapFO3 = 17;
+        private const int ShaderTypeWing = 29;
+        private const int ShaderTypeSkinTint = 31;
+        private const int ShaderTypeHairTint = 32;
+        private const int ShaderTypeParallaxOccInner = 33;
+        private const int ShaderTypeTallGrass = 34;
+        private const int ShaderTypeLODLandscapeNoGrass = 35;
+
         public static StandardMaterial3D BuildMaterial(ShaderTextureInfo shader, AlphaPropertyInfo alpha,
             Func<string, Texture2D> loadTexture, Func<string, bool> textureHasAlpha = null)
         {
@@ -28,45 +49,89 @@ namespace OpenFo3.NIF
             }
 
             var texPaths = shader.TexturePaths;
-            bool hasAlphaBlend = false;
-            bool hasAlphaTest = false;
-            int alphaThreshold = 128;
+            ApplyAlpha(mat, shader, alpha, texPaths, textureHasAlpha);
 
+            if ((shader.ShaderFlags2 & (1 << 5)) != 0)
+                mat.VertexColorUseAsAlbedo = true;
+
+            switch (shader.ShaderType)
+            {
+                case ShaderTypeGlowShader:
+                    BuildGlowShader(mat, shader, texPaths, loadTexture);
+                    break;
+                case ShaderTypeEnvironmentMap:
+                case ShaderTypeEnvironmentMapFO3:
+                    BuildEnvironmentMap(mat, shader, texPaths, loadTexture);
+                    break;
+                case ShaderTypeSkinTint:
+                    BuildSkinTint(mat, shader, texPaths, loadTexture);
+                    break;
+                case ShaderTypeHairTint:
+                    BuildHairTint(mat, shader, texPaths, loadTexture);
+                    break;
+                case ShaderTypeTallGrass:
+                    BuildTallGrass(mat, shader, texPaths, loadTexture);
+                    break;
+                case ShaderTypeMultiLayerParallax:
+                case ShaderTypeParallaxOcc:
+                case ShaderTypeMultiLayerParallaxOcc:
+                case ShaderTypeParallaxOccInner:
+                    BuildMultiLayerParallax(mat, shader, texPaths, loadTexture);
+                    break;
+                case ShaderTypeHeightmap:
+                    BuildHeightmap(mat, shader, texPaths, loadTexture);
+                    break;
+                default:
+                    BuildDefault(mat, shader, texPaths, loadTexture);
+                    break;
+            }
+
+            ApplyRefraction(mat, shader);
+            return mat;
+        }
+
+        private static void ApplyAlpha(StandardMaterial3D mat, ShaderTextureInfo shader,
+            AlphaPropertyInfo alpha, string[] texPaths, Func<string, bool> textureHasAlpha)
+        {
             if (alpha != null)
             {
                 ushort f = alpha.Flags;
-                hasAlphaBlend = (f & 0x0001) != 0;
-                hasAlphaTest = (f & 0x0200) != 0;
-                alphaThreshold = alpha.Threshold;
+                bool hasAlphaBlend = (f & 0x0001) != 0;
+                bool hasAlphaTest = (f & 0x0200) != 0;
 
                 if (hasAlphaBlend)
-                {
                     mat.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
-                }
                 else if (hasAlphaTest)
                 {
                     mat.Transparency = BaseMaterial3D.TransparencyEnum.AlphaScissor;
-                    mat.AlphaScissorThreshold = alphaThreshold / 255f;
+                    mat.AlphaScissorThreshold = alpha.Threshold / 255f;
                 }
             }
             else if ((shader.ShaderFlags & 0x00000100) != 0)
             {
                 bool diffuseHasAlpha = false;
-                if (textureHasAlpha != null && texPaths != null && texPaths.Length > SlotDiffuse && !string.IsNullOrEmpty(texPaths[SlotDiffuse]))
+                if (textureHasAlpha != null && texPaths != null &&
+                    texPaths.Length > SlotDiffuse && !string.IsNullOrEmpty(texPaths[SlotDiffuse]))
                 {
                     diffuseHasAlpha = textureHasAlpha(texPaths[SlotDiffuse]);
                 }
-
                 if (diffuseHasAlpha)
                 {
                     mat.Transparency = BaseMaterial3D.TransparencyEnum.AlphaScissor;
                     mat.AlphaScissorThreshold = 0.5f;
                 }
             }
+        }
 
-            if ((shader.ShaderFlags2 & (1 << 5)) != 0)
+        private static void ApplyCommonTextures(StandardMaterial3D mat, string[] texPaths,
+            Func<string, Texture2D> loadTexture)
+        {
+            if (texPaths == null) return;
+
+            if (texPaths.Length > SlotDiffuse && !string.IsNullOrEmpty(texPaths[SlotDiffuse]))
             {
-                mat.VertexColorUseAsAlbedo = true;
+                var tex = loadTexture(texPaths[SlotDiffuse]);
+                if (tex != null) mat.AlbedoTexture = tex;
             }
 
             mat.Roughness = 0.6f;
@@ -74,6 +139,22 @@ namespace OpenFo3.NIF
 
             if ((shader.ShaderFlags & 0x00000001) != 0)
             {
+                var tex = loadTexture(texPaths[SlotEnvironmentMask]);
+                if (tex != null)
+                {
+                    mat.RoughnessTexture = tex;
+                    mat.RoughnessTextureChannel = BaseMaterial3D.TextureChannel.Red;
+                }
+            }
+        }
+
+        private static void BuildDefault(StandardMaterial3D mat, ShaderTextureInfo shader,
+            string[] texPaths, Func<string, Texture2D> loadTexture)
+        {
+            mat.Roughness = 0.6f;
+            mat.Metallic = 0.0f;
+
+            if ((shader.ShaderFlags & 0x00000001) != 0)
                 mat.SpecularMode = BaseMaterial3D.SpecularModeEnum.SchlickGgx;
             }
             else
@@ -91,11 +172,29 @@ namespace OpenFo3.NIF
             // ---- Diffuse / Albedo (Slot 0) ----
             if (texPaths != null && texPaths.Length > SlotDiffuse && !string.IsNullOrEmpty(texPaths[SlotDiffuse]))
             {
-                var tex = loadTexture(texPaths[SlotDiffuse]);
+                var tex = loadTexture(texPaths[SlotGlowSkinHair]);
                 if (tex != null)
                 {
-                    mat.AlbedoTexture = tex;
+                    mat.EmissionTexture = tex;
+                    mat.EmissionEnabled = true;
+                    mat.Emission = new Color(1f, 1f, 1f);
                 }
+            }
+        }
+
+        private static void BuildEnvironmentMap(StandardMaterial3D mat, ShaderTextureInfo shader,
+            string[] texPaths, Func<string, Texture2D> loadTexture)
+        {
+            mat.Roughness = 0.3f;
+            mat.Metallic = 0.8f;
+            mat.SpecularMode = BaseMaterial3D.SpecularModeEnum.SchlickGgx;
+
+            if (texPaths == null) return;
+
+            if (texPaths.Length > SlotDiffuse && !string.IsNullOrEmpty(texPaths[SlotDiffuse]))
+            {
+                var tex = loadTexture(texPaths[SlotDiffuse]);
+                if (tex != null) mat.AlbedoTexture = tex;
             }
 
             // ---- Normal Map (Slot 1) ----
@@ -144,6 +243,7 @@ namespace OpenFo3.NIF
                     mat.Emission = new Color(1f, 1f, 1f);
                 }
             }
+        }
 
             // ---- Heightmap / Parallax (Slot 3) ----
             if (texPaths != null && texPaths.Length > SlotHeightParallax && !string.IsNullOrEmpty(texPaths[SlotHeightParallax]))
@@ -157,6 +257,7 @@ namespace OpenFo3.NIF
                     mat.HeightmapMaxLayers = Mathf.Max(1, (int)shader.ParallaxMaxPasses);
                 }
             }
+        }
 
             // ---- Detail Map (Slot 6) ----
             if (texPaths != null && texPaths.Length > SlotSubsurface && !string.IsNullOrEmpty(texPaths[SlotSubsurface]))
@@ -168,6 +269,7 @@ namespace OpenFo3.NIF
                     mat.DetailEnabled = true;
                 }
             }
+        }
 
             // ---- Refraction ----
             if ((shader.ShaderFlags & (1 << 15)) != 0 || (shader.ShaderFlags & (1 << 16)) != 0)
@@ -175,8 +277,6 @@ namespace OpenFo3.NIF
                 mat.RefractionEnabled = true;
                 mat.RefractionScale = shader.RefractionStrength > 0 ? shader.RefractionStrength : 0.05f;
             }
-
-            return mat;
         }
     }
 }
