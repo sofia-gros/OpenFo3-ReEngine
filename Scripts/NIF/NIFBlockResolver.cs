@@ -174,8 +174,7 @@ namespace OpenFo3.NIF
             int controllerRef = br.ReadInt32();
 
             // 2. NiAVObject fields
-            // FO3 20.2.0.7: flags は uint16 の後に Unknown Short (2バイト) が続き、
-            // 合計4バイト占有する。uint32 として読むのが正しい。
+            // FO3 20.2.0.7: flags は uint32 (4バイト)。PyFFI ground truth + binary remainder=0 で確定。
             uint flags = br.ReadUInt32();
             if (dbg) GD.Print($"  flags={flags & 0xFFFF} (uint32={flags:X8}) pos={br.BaseStream.Position}");
 
