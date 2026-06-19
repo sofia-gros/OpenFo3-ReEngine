@@ -131,10 +131,22 @@ public partial class Megaton : Node3D
 
 			foreach (var tile in tiles)
 			{
+				var name = $"Terrain_{tile.CellCoord.X}_{tile.CellCoord.Y}";
+
 				var inst = new MeshInstance3D();
 				inst.Mesh = tile.Mesh;
-				inst.Name = $"Terrain_{tile.CellCoord.X}_{tile.CellCoord.Y}";
+				inst.Name = name;
 				AddChild(inst);
+
+				if (tile.CollisionShape != null)
+				{
+					var body = new StaticBody3D();
+					body.Name = $"{name}_Collision";
+					var colShape = new CollisionShape3D();
+					colShape.Shape = tile.CollisionShape;
+					body.AddChild(colShape);
+					AddChild(body);
+				}
 			}
 		}
 		catch (Exception e)

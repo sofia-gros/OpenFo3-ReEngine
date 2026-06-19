@@ -42,12 +42,15 @@ namespace OpenFo3.ESM
             var index = new Dictionary<uint, RecordEntry>();
             var targetSet = new HashSet<string>(targetTypes);
             
+            _totalSeen = 0;
             _stream.Position = 0;
             TraverseNodes(_stream.Length, targetSet, index, 0, 0);
             
+            GD.Print($"[ESMReader] BuildFormIdIndex({string.Join(",", targetTypes)}): {index.Count} found, {_totalSeen} total nodes seen");
             return index;
         }
 
+        private int _totalSeen = 0;
         private void TraverseNodes(long end, HashSet<string> targetSet, Dictionary<uint, RecordEntry> index, uint currentWorld, uint currentCell)
         {
             while (_stream.Position < end && _stream.Position < _stream.Length)
@@ -57,6 +60,7 @@ namespace OpenFo3.ESM
 
                 string type = ReadTag();
                 uint size = _reader.ReadUInt32();
+                _totalSeen++;
 
                 if (type == "GRUP")
                 {
