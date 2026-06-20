@@ -38,6 +38,19 @@ namespace OpenFo3.NIF
         const int ShaderTypeFO3Water = 41;
         const int ShaderTypeFO3Unlit = 42;
 
+        private static bool IsShadowTexture(string[] texPaths)
+        {
+            if (texPaths == null) return false;
+            for (int i = 0; i < texPaths.Length; i++)
+            {
+                if (string.IsNullOrEmpty(texPaths[i])) continue;
+                string p = texPaths[i].ToLowerInvariant();
+                if (p.Contains("shadow") || p.Contains("shdw") || p.Contains("ambient_occlusion"))
+                    return true;
+            }
+            return false;
+        }
+
         public static StandardMaterial3D BuildMaterial(ShaderTextureInfo shader, AlphaPropertyInfo alpha,
             Func<string, Texture2D> loadTexture, Func<string, bool> textureHasAlpha = null)
         {
@@ -52,6 +65,14 @@ namespace OpenFo3.NIF
             }
 
             var texPaths = shader.TexturePaths;
+
+            // Check if this is a shadow/ambient occlusion surface (white mesh fix)
+            if (IsShadowTexture(texPaths))
+            {
+                BuildShadow(mat, shader, texPaths, loadTexture);
+                return mat;
+            }
+
             ApplyAlpha(mat, shader, alpha, texPaths, textureHasAlpha);
 
             if ((shader.ShaderFlags2 & (1 << 5)) != 0)
@@ -113,6 +134,28 @@ namespace OpenFo3.NIF
             return mat;
         }
 
+        private static void BuildShadow(StandardMaterial3D mat, ShaderTextureInfo shader,
+            string[] texPaths, Func<string, Texture2D> loadTexture)
+        {
+            // FO3 pre-baked shadow/ambient occlusion geometry.
+            // These are dark translucent meshes placed underneath building edges
+            // to simulate soft shadows without real-time lighting.
+            mat.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
+            mat.Roughness = 0.8f;
+            mat.Metallic = 0.0f;
+            mat.SpecularMode = BaseMaterial3D.SpecularModeEnum.Disabled;
+            mat.DisableAmbientLight = true;
+            mat.ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded;
+            mat.AlbedoColor = new Color(0.05f, 0.05f, 0.08f, 0.4f);
+
+            if (texPaths != null && texPaths.Length > 0 && !string.IsNullOrEmpty(texPaths[0]))
+            {
+                var tex = loadTexture(texPaths[0]);
+                if (tex != null)
+                    mat.AlbedoTexture = tex;
+            }
+        }
+
         private static void ApplyAlpha(StandardMaterial3D mat, ShaderTextureInfo shader,
             AlphaPropertyInfo alpha, string[] texPaths, Func<string, bool> textureHasAlpha)
         {
@@ -122,12 +165,22 @@ namespace OpenFo3.NIF
                 bool hasAlphaBlend = (f & 0x0001) != 0;
                 bool hasAlphaTest = (f & 0x0200) != 0;
 
-                if (hasAlphaBlend)
-                    mat.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
-                else if (hasAlphaTest)
+                // テクスチャが実際にαチャンネルを持っている場合のみ透過を適用
+                // FO3 では NiAlphaProperty がデフォルトで AlphaTest=true のため、
+                // テクスチャにαがない場合は無視する
+                bool texActuallyHasAlpha = textureHasAlpha != null && texPaths != null &&
+                    texPaths.Length > SlotDiffuse && !string.IsNullOrEmpty(texPaths[SlotDiffuse]) &&
+                    textureHasAlpha(texPaths[SlotDiffuse]);
+
+                if (texActuallyHasAlpha)
                 {
-                    mat.Transparency = BaseMaterial3D.TransparencyEnum.AlphaScissor;
-                    mat.AlphaScissorThreshold = alpha.Threshold / 255f;
+                    if (hasAlphaBlend)
+                        mat.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
+                    else if (hasAlphaTest)
+                    {
+                        mat.Transparency = BaseMaterial3D.TransparencyEnum.AlphaScissor;
+                        mat.AlphaScissorThreshold = alpha.Threshold / 255f;
+                    }
                 }
             }
             else if ((shader.ShaderFlags & 0x00000100) != 0)
@@ -522,6 +575,41 @@ namespace OpenFo3.NIF
                     mat.EmissionEnabled = true;
                     mat.Emission = new Color(1f, 1f, 1f);
                 }
+            }
+        }
+
+        /// <summary>
+        /// Post-process material based on material classification (Task 6).
+        /// Adjusts roughness/metallic/emission/etc. for more realistic surface rendering.
+        /// </summary>
+        public static void ApplyMaterialClass(StandardMaterial3D mat, MaterialClass materialClass)
+        {
+            if (materialClass == MaterialClass.Unclassified) return;
+
+            var def = MaterialClassifier.GetDefinition(materialClass);
+
+            // Only override if the texture didn't already set roughness/metallic
+            // (we use the classification as a fallback hint)
+            if (mat.RoughnessTexture == null)
+                mat.Roughness = def.Roughness;
+            if (mat.MetallicTexture == null)
+                mat.Metallic = def.Metallic;
+
+            mat.SpecularMode = def.SpecularMode;
+
+            if (def.Transparent && mat.Transparency == BaseMaterial3D.TransparencyEnum.Disabled)
+                mat.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
+
+            if (def.SubsurfaceScattering)
+            {
+                mat.SubsurfScatterEnabled = true;
+                mat.SubsurfScatterStrength = def.SubsurfaceStrength;
+            }
+
+            if (def.EmissionStrength > 0 && mat.EmissionTexture == null)
+            {
+                mat.EmissionEnabled = true;
+                mat.Emission = new Color(def.EmissionStrength, def.EmissionStrength, def.EmissionStrength);
             }
         }
     }

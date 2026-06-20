@@ -16,6 +16,7 @@ public partial class Megaton : Node3D
 	private ConcurrentDictionary<string, ArrayMesh> _meshCache = new();
 	private ConcurrentDictionary<string, NIFReader> _nifCache = new();
 	private ConcurrentDictionary<string, Texture2D> _textureCache = new();
+	private ConcurrentDictionary<string, bool> _textureHasAlpha = new();
 	private ConcurrentDictionary<string, List<ParticleSystemEntry>> _particleCache = new();
 	private ConcurrentDictionary<string, List<Node3D>> _skinnedCache = new();
 
@@ -71,6 +72,12 @@ public partial class Megaton : Node3D
 	private string _currentWorldName;
 	private Label3D _worldLabel;
 	private bool _initialized = false;
+	private bool _debugShowCollision = false;
+	private bool _debugShowNavigation = false;
+	private bool _debugShowPaths = false;
+	private bool _prevDebugCollision = false;
+	private bool _prevDebugNavigation = false;
+	private bool _prevDebugPaths = false;
 
 	private struct TerrainLodEntry
 	{
@@ -107,6 +114,7 @@ public partial class Megaton : Node3D
 		}
 
 		UpdateDebugOverlay();
+		UpdateDebugVisualization();
 	}
 
 	private void UpdateDebugOverlay()
@@ -126,10 +134,66 @@ public partial class Megaton : Node3D
 		var cam = GetViewport()?.GetCamera3D();
 		if (cam != null) camPos = cam.GlobalPosition;
 
-		_debugLabel.Text = $"OpenFo3: ReEngine  |  F1-F9: Switch World\n" +
+		string debugFlags = "";
+		if (_debugShowCollision) debugFlags += " COL";
+		if (_debugShowNavigation) debugFlags += " NAV";
+		if (_debugShowPaths) debugFlags += " PATH";
+		if (debugFlags.Length > 0) debugFlags = "  |" + debugFlags;
+
+		_debugLabel.Text = $"OpenFo3: ReEngine  |  1-9: Switch World\n" +
 			$"FPS: {fps,4:F0}  |  World [{worldIdx + 1}]: {worldInfo}\n" +
 			$"Queued: {pending}  |  Meshes: {meshesCached}  |  Textures: {texturesCached}  |  NIFs: {nifsCached}\n" +
-			$"Camera: ({camPos.X:F1}, {camPos.Y:F1}, {camPos.Z:F1})";
+			$"Camera: ({camPos.X:F1}, {camPos.Y:F1}, {camPos.Z:F1})" +
+			$"{debugFlags}\n" +
+			$"Ctrl+C:Collision  Ctrl+N:Nav  Ctrl+P:Path";
+	}
+
+	private void UpdateDebugVisualization()
+	{
+		// Editor debug visuals are not directly accessible via World3D in Redot 26.1.
+		// Use Ctrl+{C,N,P} key toggles instead (handled in _Input).
+		// Apply only when flags change (avoid expensive tree traversal every frame)
+		bool colChanged = _debugShowCollision != _prevDebugCollision;
+		bool navChanged = _debugShowNavigation != _prevDebugNavigation;
+		bool pathChanged = _debugShowPaths != _prevDebugPaths;
+
+		if (colChanged || navChanged || pathChanged)
+		{
+			if (_currentWorldName != null && _worldContainers.TryGetValue(_currentWorldName, out var container))
+				ToggleDebuggableNodes(container);
+			_prevDebugCollision = _debugShowCollision;
+			_prevDebugNavigation = _debugShowNavigation;
+			_prevDebugPaths = _debugShowPaths;
+		}
+	}
+
+	private void UpdateDebugVisualizationNow()
+	{
+		if (_currentWorldName != null && _worldContainers.TryGetValue(_currentWorldName, out var container))
+		{
+			ToggleDebuggableNodes(container);
+		}
+	}
+
+	private void ToggleDebuggableNodes(Node3D parent)
+	{
+		foreach (var child in parent.GetChildren())
+		{
+			if (child is CollisionShape3D cs)
+			{
+				cs.Disabled = !_debugShowCollision;
+			}
+			else if (child is NavigationRegion3D nav)
+			{
+				nav.Enabled = _debugShowNavigation;
+			}
+
+			// Recurse into containers and physics bodies
+			if (child is Node3D childNode && child.GetChildCount() > 0)
+			{
+				ToggleDebuggableNodes(childNode);
+			}
+		}
 	}
 
 	private void UpdateTerrainLod()
@@ -171,6 +235,26 @@ public partial class Megaton : Node3D
 				{
 					SwitchToWorld(_worldNameList[idx]);
 				}
+			}
+
+			// Debug visualization toggles
+			if (key.Keycode == Key.C && key.CtrlPressed)
+			{
+				_debugShowCollision = !_debugShowCollision;
+				GD.Print($"[Megaton] Debug collision: {_debugShowCollision}");
+				UpdateDebugVisualizationNow();
+			}
+			if (key.Keycode == Key.N && key.CtrlPressed)
+			{
+				_debugShowNavigation = !_debugShowNavigation;
+				GD.Print($"[Megaton] Debug navigation: {_debugShowNavigation}");
+				UpdateDebugVisualizationNow();
+			}
+			if (key.Keycode == Key.P && key.CtrlPressed)
+			{
+				_debugShowPaths = !_debugShowPaths;
+				GD.Print($"[Megaton] Debug paths: {_debugShowPaths}");
+				UpdateDebugVisualizationNow();
 			}
 		}
 	}
@@ -824,7 +908,32 @@ public partial class Megaton : Node3D
 
 		_cachedCamera = null;
 
+		if (_worldDataByName.TryGetValue(worldName, out var cameraWd))
+		{
+			RepositionCameraForWorld(cameraWd);
+		}
+
 		GD.Print($"[Megaton] Now showing world: {worldName}");
+	}
+
+	private void RepositionCameraForWorld(WorldData wd)
+	{
+		var cam = GetViewport()?.GetCamera3D();
+		if (cam == null) return;
+
+		float fo3X = (wd.NwCellX + wd.SeCellX) * CellSize / 2f;
+		float fo3Y = (wd.NwCellY + wd.SeCellY) * CellSize / 2f;
+
+		float godotX = (fo3X - wd.Center.X) * WorldScale;
+		float godotZ = -(fo3Y - wd.Center.Y) * WorldScale;
+
+		// Place camera at terrain height: defaultLandHeight accounts for base elevation,
+		// add 20 Godot units (~1333 FO3 units) to account for typical VHGT offset
+		float godotY = wd.DefaultLandHeight * WorldScale + 20f;
+
+		cam.GlobalPosition = new Vector3(godotX, godotY, godotZ);
+
+		GD.Print($"[Megaton] Camera -> ({godotX:F1}, {godotY:F1}, {godotZ:F1}) for '{wd.Name}'");
 	}
 
 	private void CreateAndAddInstance(InstanceRequest req)
@@ -1000,6 +1109,9 @@ public partial class Megaton : Node3D
 		if (_meshCache.TryGetValue(path, out var cached)) return cached;
 		if (!_nifCache.TryGetValue(path, out var nif)) return null;
 
+		// Classify NIF path for material override (Task 6)
+		MaterialClass matClass = MaterialClassifier.ClassifyByPath(path);
+
 		var geom = NIFMeshBuilder.ExtractGeometry(nif);
 
 		// Cache particle systems
@@ -1030,7 +1142,7 @@ public partial class Megaton : Node3D
 				if (geom.Surfaces.Count > i)
 				{
 					var surface = geom.Surfaces[i];
-					var mat = NIFMaterialBuilder.BuildMaterial(surface.Shader, surface.Alpha, LoadTexture);
+					var mat = NIFMaterialBuilder.BuildMaterial(surface.Shader, surface.Alpha, LoadTexture, TextureHasAlpha);
 
 					if (mat.AlbedoTexture == null && !string.IsNullOrEmpty(texPath))
 					{
@@ -1041,8 +1153,17 @@ public partial class Megaton : Node3D
 						}
 					}
 
-					if (mat.Transparency != BaseMaterial3D.TransparencyEnum.Disabled)
-						mat.RenderPriority = i;
+					// Apply material class override (Task 6: 材質分類)
+					// Classify by NIF path, with shader type and havok material hints
+					MaterialClass surfaceClass = matClass;
+					if (surface.Shader != null)
+					{
+						var shaderBased = MaterialClassifier.ClassifyByShaderType(surface.Shader.ShaderType);
+						if (shaderBased != MaterialClass.Unclassified)
+							surfaceClass = shaderBased;
+					}
+					NIFMaterialBuilder.ApplyMaterialClass(mat, surfaceClass);
+
 					mesh.SurfaceSetMaterial(i, mat);
 				}
 				else if (!string.IsNullOrEmpty(texPath))
@@ -1050,9 +1171,9 @@ public partial class Megaton : Node3D
 					var tex = LoadTexture(texPath);
 					if (tex != null)
 					{
-						var mat = new StandardMaterial3D { AlbedoTexture = tex };
-						mat.RenderPriority = i;
-						mesh.SurfaceSetMaterial(i, mat);
+					var mat = new StandardMaterial3D { AlbedoTexture = tex };
+					NIFMaterialBuilder.ApplyMaterialClass(mat, matClass);
+					mesh.SurfaceSetMaterial(i, mat);
 					}
 				}
 			}
@@ -1062,6 +1183,37 @@ public partial class Megaton : Node3D
 		}
 
 		return null;
+	}
+
+	private Texture2D _fallbackMagentaTex;
+	private Texture2D _fallbackShadowTex;
+
+	private Texture2D GetFallbackMagenta()
+	{
+		if (_fallbackMagentaTex == null)
+		{
+			var img = Image.CreateEmpty(4, 4, false, Image.Format.Rgba8);
+			img.Fill(new Color(1f, 0f, 1f));
+			_fallbackMagentaTex = ImageTexture.CreateFromImage(img);
+		}
+		return _fallbackMagentaTex;
+	}
+
+	private Texture2D GetFallbackShadow()
+	{
+		if (_fallbackShadowTex == null)
+		{
+			var img = Image.CreateEmpty(4, 4, false, Image.Format.Rgba8);
+			img.Fill(new Color(0.05f, 0.05f, 0.05f, 0.6f));
+			_fallbackShadowTex = ImageTexture.CreateFromImage(img);
+		}
+		return _fallbackShadowTex;
+	}
+
+	private bool IsShadowTexturePath(string path)
+	{
+		string lower = path.ToLowerInvariant();
+		return lower.Contains("shadow") || lower.Contains("shdw") || lower.Contains("ambient_occlusion");
 	}
 
 	private Texture2D LoadTexture(string path)
@@ -1096,7 +1248,17 @@ public partial class Megaton : Node3D
 			}
 		}
 
-		if (file == null || owner == null) return null;
+		if (file == null || owner == null)
+		{
+			// Return fallback textures for shadow/known textures even if not found in BSA
+			if (IsShadowTexturePath(searchPath))
+			{
+				var shadowTex = GetFallbackShadow();
+				_textureCache.TryAdd(searchPath, shadowTex);
+				return shadowTex;
+			}
+			return null;
+		}
 
 		byte[] data = owner.ReadFileData(file);
 		if (data == null) return null;
@@ -1107,10 +1269,42 @@ public partial class Megaton : Node3D
 		{
 			var tex = ImageTexture.CreateFromImage(img);
 			_textureCache.TryAdd(searchPath, tex);
+
+			bool hasAlpha = img.GetFormat() == Image.Format.Rgba8;
+			if (!hasAlpha)
+			{
+				string fmtName = img.GetFormat().ToString();
+				hasAlpha = fmtName.IndexOf("A", StringComparison.OrdinalIgnoreCase) >= 0;
+			}
+			_textureHasAlpha.TryAdd(searchPath, hasAlpha);
+
 			return tex;
 		}
 
-		return null;
+		// DDS load failed - try alternative approach for problematic formats
+		// Some FO3 textures use custom DDS headers or unusual compression formats
+		// Fall back to magenta error texture or shadow fallback
+		if (IsShadowTexturePath(searchPath))
+		{
+			var shadowTex = GetFallbackShadow();
+			_textureCache.TryAdd(searchPath, shadowTex);
+			_textureHasAlpha.TryAdd(searchPath, true);
+			return shadowTex;
+		}
+
+		GD.Print($"[Megaton] WARNING: Failed to load DDS texture '{searchPath}' (err={err}) - using fallback");
+		var fallback = GetFallbackMagenta();
+		_textureCache.TryAdd(searchPath, fallback);
+		return fallback;
+	}
+
+	private bool TextureHasAlpha(string path)
+	{
+		path = path.Replace('\\', '/');
+		string searchPath = path;
+		if (!searchPath.StartsWith("textures/", StringComparison.OrdinalIgnoreCase))
+			searchPath = "textures/" + searchPath;
+		return _textureHasAlpha.TryGetValue(searchPath, out var hasAlpha) && hasAlpha;
 	}
 
 	private Node3D CloneNodeTree(Node3D src)

@@ -19,7 +19,12 @@ namespace OpenFo3.World
         // FO3の高さ単位（VHGT baseHeight + 累積デルタ）は絶対Z値であり、
         // REFRアセットのZ値と同一座標系。異なる倍率をかけると建物が地形に
         // めり込んだり浮いたりする。基本的に 1.0 のままにすること。
-        private const float HeightExaggeration = 1.0f;
+        // 地形高さ強調倍率。2〜3倍程度で凸凹が視認しやすくなる。
+        // ただし大きくしすぎると建物の位置とズレるため注意。
+        // 衝突判定はかならず HeightScale のみ使用（Exaggeration は視覚用）。
+        private float _heightExaggeration = 1.0f;
+        // 衝突判定用の高さ強調倍率（常に1.0、視覚と分離）
+        private const float CollisionHeightExaggeration = 1.0f;
 
         private ESMReader _esm;
         private Dictionary<uint, RecordEntry> _landIndex;
@@ -111,6 +116,8 @@ namespace OpenFo3.World
             var coveredCells = new HashSet<(int, int)>();
             var landCells = new List<uint>();
 
+            GD.Print($"[TerrainBuilder] Looking for LAND records in world 0x{worldFormId:X8}");
+
             foreach (var kvp in _landIndex)
             {
                 if (kvp.Value.WorldFormId == worldFormId)
@@ -119,7 +126,9 @@ namespace OpenFo3.World
                 }
             }
 
-            GD.Print($"[TerrainBuilder] Found {landCells.Count} LAND records in world 0x{worldFormId:X8}");
+            // Build a reliable LAND→coordinate map by scanning the WRLD's children in order
+            var landCoords = _esm.BuildLandCoordinateMap(_landIndex, _cellIndex, worldFormId);
+            GD.Print($"[TerrainBuilder] Found {landCells.Count} LAND records, {landCoords.Count} have cell coords");
 
             foreach (uint landFormId in landCells)
             {
@@ -129,16 +138,17 @@ namespace OpenFo3.World
                     continue;
                 }
 
-                uint cellFormId = landEntry.CellFormId;
-                if (!TryGetCellCoord(cellFormId, out int cellX, out int cellY))
+                if (!landCoords.TryGetValue(landFormId, out var coord))
                 {
-                    GD.Print($"[TerrainBuilder] Failed to get cell coords for CELL 0x{cellFormId:X8} (LAND 0x{landFormId:X8}) - skipping LAND tile");
+                    GD.Print($"[TerrainBuilder] LAND 0x{landFormId:X8} has no cell coordinate mapping - skipping");
                     continue;
                 }
+                int cellX = coord.Item1;
+                int cellY = coord.Item2;
 
                 coveredCells.Add((cellX, cellY));
 
-                var tile = BuildTerrainTile(landFormId, cellX, cellY, loadTexture, megatonCenter);
+                var tile = BuildTerrainTile(landFormId, cellX, cellY, loadTexture, megatonCenter, defaultLandHeight);
                 if (tile != null)
                 {
                     tiles.Add(tile);
@@ -150,23 +160,8 @@ namespace OpenFo3.World
                 }
             }
 
-            // Fill gaps with flat terrain
-            bool hasValidBounds = fillCellMaxX >= fillCellMinX && fillCellMaxY >= fillCellMinY;
-            if (!hasValidBounds && coveredCells.Count > 0)
-            {
-                fillCellMinX = int.MaxValue; fillCellMinY = int.MaxValue;
-                fillCellMaxX = int.MinValue; fillCellMaxY = int.MinValue;
-                foreach (var (x, y) in coveredCells)
-                {
-                    if (x < fillCellMinX) fillCellMinX = x;
-                    if (x > fillCellMaxX) fillCellMaxX = x;
-                    if (y < fillCellMinY) fillCellMinY = y;
-                    if (y > fillCellMaxY) fillCellMaxY = y;
-                }
-                hasValidBounds = true;
-            }
-
-            if (hasValidBounds)
+            // Fill gaps between real LAND tiles with flat terrain
+            if (coveredCells.Count > 0)
             {
                 int landMinX = int.MaxValue, landMinY = int.MaxValue;
                 int landMaxX = int.MinValue, landMaxY = int.MinValue;
@@ -178,17 +173,29 @@ namespace OpenFo3.World
                     if (y > landMaxY) landMaxY = y;
                 }
 
-                int padding = coveredCells.Count > 0 ? 10 : 0;
-                int fillMinX = Math.Max(landMinX - padding, fillCellMinX);
-                int fillMinY = Math.Max(landMinY - padding, fillCellMinY);
-                int fillMaxX = Math.Min(landMaxX + padding, fillCellMaxX);
-                int fillMaxY = Math.Min(landMaxY + padding, fillCellMaxY);
-
-                int totalCells = (fillMaxX - fillMinX + 1) * (fillMaxY - fillMinY + 1);
-                if (totalCells > 5000)
+                int padding = 5;
+                int fillMinX = int.MaxValue, fillMinY = int.MaxValue;
+                int fillMaxX = int.MinValue, fillMaxY = int.MinValue;
+                if (fillCellMaxX >= fillCellMinX && fillCellMaxY >= fillCellMinY)
                 {
-                    GD.Print($"[TerrainBuilder] WARNING: {totalCells} flat tiles exceeds 5000 cap — using padding=5");
-                    padding = 5;
+                    fillMinX = Math.Max(landMinX - padding, fillCellMinX);
+                    fillMinY = Math.Max(landMinY - padding, fillCellMinY);
+                    fillMaxX = Math.Min(landMaxX + padding, fillCellMaxX);
+                    fillMaxY = Math.Min(landMaxY + padding, fillCellMaxY);
+                }
+                else
+                {
+                    fillMinX = landMinX - padding;
+                    fillMinY = landMinY - padding;
+                    fillMaxX = landMaxX + padding;
+                    fillMaxY = landMaxY + padding;
+                }
+
+                int totalFill = (fillMaxX - fillMinX + 1) * (fillMaxY - fillMinY + 1);
+                if (totalFill > 3000)
+                {
+                    GD.Print($"[TerrainBuilder] WARNING: {totalFill} flat tiles exceeds 3000 cap — using padding=2");
+                    padding = 2;
                     fillMinX = Math.Max(landMinX - padding, fillCellMinX);
                     fillMinY = Math.Max(landMinY - padding, fillCellMinY);
                     fillMaxX = Math.Min(landMaxX + padding, fillCellMaxX);
@@ -211,38 +218,7 @@ namespace OpenFo3.World
                         }
                     }
                 }
-                GD.Print($"[TerrainBuilder] Built {flatBuilt} gap-fill flat terrain tiles at default height {defaultLandHeight} (area {totalCells} cells)");
-            }
-
-            // If absolutely NO tiles were generated (no LAND records + no flat fill),
-            // force-generate flat terrain for the world cell bounds
-            if (tiles.Count == 0 && fillCellMaxX >= fillCellMinX && fillCellMaxY >= fillCellMinY)
-            {
-                int totalCells = (fillCellMaxX - fillCellMinX + 1) * (fillCellMaxY - fillCellMinY + 1);
-                int midX = (fillCellMinX + fillCellMaxX) / 2;
-                int midY = (fillCellMinY + fillCellMaxY) / 2;
-                int halfSize = 70;
-                int minX = Math.Max(fillCellMinX, midX - halfSize);
-                int maxX = Math.Min(fillCellMaxX, midX + halfSize);
-                int minY = Math.Max(fillCellMinY, midY - halfSize);
-                int maxY = Math.Min(fillCellMaxY, midY + halfSize);
-
-                GD.Print($"[TerrainBuilder] No tiles generated! Force-generating flat terrain for cell range ({minX},{minY})-({maxX},{maxY})");
-
-                int forceBuilt = 0;
-                for (int y = minY; y <= maxY; y++)
-                {
-                    for (int x = minX; x <= maxX; x++)
-                    {
-                        var flatTile = BuildFlatTerrainTile(x, y, defaultLandHeight, megatonCenter);
-                        if (flatTile != null)
-                        {
-                            tiles.Add(flatTile);
-                            forceBuilt++;
-                        }
-                    }
-                }
-                GD.Print($"[TerrainBuilder] Force-built {forceBuilt} flat terrain tiles at default height {defaultLandHeight}");
+                GD.Print($"[TerrainBuilder] Built {flatBuilt} gap-fill flat tiles around {coveredCells.Count} LAND tiles");
             }
 
             return tiles;
@@ -284,7 +260,7 @@ namespace OpenFo3.World
         }
 
         private TerrainTile BuildTerrainTile(uint landFormId, int cellX, int cellY,
-            Func<string, Texture2D> loadTexture, Vector2 megatonCenter)
+            Func<string, Texture2D> loadTexture, Vector2 megatonCenter, float defaultLandHeight)
         {
             try
             {
@@ -331,27 +307,35 @@ namespace OpenFo3.World
                     GD.Print($"[TerrainBuilder] Using fallback texture: {terrainTexPath}");
                 }
 
-                // Parse height map — VHGT: float baseHeight + 1089 unsigned bytes (33x33, row-major).
-                // heights[0,0] = baseHeight. Remaining 1088 vertices: cumulative deltas (signed /8).
-                // byte[0] is delta from baseHeight to (0,0), applied at (0,0); subsequent bytes
-                // are deltas from previous vertex to current vertex in row-major order.
+                // Parse height map — VHGT: float baseHeight + 1089 signed bytes (33x33, row-major).
+                // Heights are calculated using cumulative propagation:
+                // - The leftmost column (col=0) is cumulative vertically from south to north.
+                // - Each row is cumulative horizontally from west to east starting from col=0.
+                // Each delta step represents a factor of 8.0 game units.
                 float baseHeight = BitConverter.ToSingle(vhgtData, 0);
                 float[,] heights = new float[GridSize, GridSize];
-                float currentHeight = baseHeight;
+                
+                sbyte[,] deltas = new sbyte[GridSize, GridSize];
                 int vhgtOff = 4;
                 for (int row = 0; row < GridSize; row++)
                 {
                     for (int col = 0; col < GridSize; col++)
                     {
-                        if (row > 0 || col > 0)
+                        if (vhgtOff < vhgtData.Length)
                         {
-                            if (vhgtOff < vhgtData.Length)
-                            {
-                                currentHeight += (sbyte)vhgtData[vhgtOff] / 8f;
-                                vhgtOff++;
-                            }
+                            deltas[row, col] = (sbyte)vhgtData[vhgtOff++];
                         }
-                        heights[row, col] = currentHeight;
+                    }
+                }
+
+                float tempRowHeight = baseHeight;
+                for (int row = 0; row < GridSize; row++)
+                {
+                    tempRowHeight += deltas[row, 0] * 8f;
+                    heights[row, 0] = tempRowHeight;
+                    for (int col = 1; col < GridSize; col++)
+                    {
+                        heights[row, col] = heights[row, col - 1] + deltas[row, col] * 8f;
                     }
                 }
 
@@ -375,8 +359,10 @@ namespace OpenFo3.World
                     }
                 }
 
-                // Debug: print height range
+                // Debug: print height range including raw VHGT delta statistics
                 float minH = float.MaxValue, maxH = float.MinValue;
+                float totalDelta = 0;
+                int nonZeroDeltas = 0;
                 for (int r = 0; r < GridSize; r++)
                     for (int c = 0; c < GridSize; c++)
                     {
@@ -384,12 +370,24 @@ namespace OpenFo3.World
                         if (h < minH) minH = h;
                         if (h > maxH) maxH = h;
                     }
+                // Count non-zero deltas in VHGT (skip base height at bytes 0-3)
+                for (int i = 4; i < vhgtData.Length; i++)
+                {
+                    float delta = (sbyte)vhgtData[i] / 8f;
+                    if (Math.Abs(delta) > 0.001f)
+                    {
+                        nonZeroDeltas++;
+                        totalDelta += Math.Abs(delta);
+                    }
+                }
                 float cellHMinGodot = minH * HeightScale;
                 float cellHMaxGodot = maxH * HeightScale;
+                float rawBaseH = BitConverter.ToSingle(vhgtData, 0);
                 GD.Print($"[TerrainBuilder] LAND 0x{landFormId:X8} cell({cellX},{cellY})" +
-                    $" baseH={BitConverter.ToSingle(vhgtData, 0):F1}" +
+                    $" landH={defaultLandHeight:F1} vhgtBase={rawBaseH:F1} actualH={baseHeight:F1}" +
                     $" rawH=[{minH:F1}, {maxH:F1}] (Δ={maxH - minH:F1})" +
-                    $" godotY=[{cellHMinGodot:F2}, {cellHMaxGodot:F2}] (Δ={(maxH - minH) * HeightScale:F2})");
+                    $" godotY=[{cellHMinGodot:F2}, {cellHMaxGodot:F2}] (Δ={(maxH - minH) * HeightScale:F4})" +
+                    $" vhgtBytes={vhgtData.Length} nonzeroDeltas={nonZeroDeltas} avgDeltaMag={totalDelta / Math.Max(1, nonZeroDeltas):F3}");
 
                 // Build mesh
                 return BuildTerrainMesh(heights, colors, cellX, cellY, landFormId, megatonCenter, loadTexture, terrainTexPath);
@@ -441,9 +439,8 @@ namespace OpenFo3.World
                     // FO3 coords: X=col, Y=row, Z=height
                     // Convert to Godot: (X, Z, -Y) offset by megatonCenter (same as REFR)
                     float godotX = (originX + col * step - megatonCenter.X) * WorldScale;
-                    // Center-preserving height exaggeration: keeps average Y unchanged
-                    // while amplifying the variation to make terrain visible
-                    float godotY = (hCenter + (heights[row, col] - hCenter) * HeightExaggeration) * HeightScale;
+                    // Height exaggeration for visual terrain (makes bumps visible)
+                    float godotY = (hCenter + (heights[row, col] - hCenter) * _heightExaggeration) * HeightScale;
                     float godotZ = -(originY + row * step - megatonCenter.Y) * WorldScale;
 
                     verts[idx] = new Vector3(godotX, godotY, godotZ);
@@ -554,14 +551,26 @@ namespace OpenFo3.World
                 if (y > vMaxY) vMaxY = y;
             }
             float vRangeY = vMaxY - vMinY;
-            if (vRangeY < 0.01f)
-                GD.Print($"[TerrainBuilder] *** WARNING: cell({cellX},{cellY}) vertex Y range is ONLY {vRangeY:F4} Godot units — terrain is effectively FLAT!");
-            GD.Print($"[TerrainBuilder] cell({cellX},{cellY}) vertex Y: min={vMinY:F3} max={vMaxY:F3} range={vRangeY:F3}  (HeightExaggeration={HeightExaggeration}x, HeightScale={HeightScale})");
+            if (vRangeY < 0.0001f)
+                GD.Print($"[TerrainBuilder] *** WARNING: cell({cellX},{cellY}) vertex Y range is ONLY {vRangeY:F6} Godot units — terrain is FLAT!");
+            GD.Print($"[TerrainBuilder] cell({cellX},{cellY}) vertex Y: min={vMinY:F3} max={vMaxY:F3} range={vRangeY:F3}  (Exaggeration={_heightExaggeration}x, HeightScale={HeightScale})");
 
-            // Build collision shape from mesh geometry
+            // Build collision shape from mesh geometry (use non-exaggerated height for accuracy)
+            var colVerts = new Vector3[totalVerts];
+            for (int row = 0; row < GridSize; row++)
+            {
+                for (int col = 0; col < GridSize; col++)
+                {
+                    int idx = row * GridSize + col;
+                    float godotX = (originX + col * step - megatonCenter.X) * WorldScale;
+                    float godotY = (hCenter + (heights[row, col] - hCenter) * CollisionHeightExaggeration) * HeightScale;
+                    float godotZ = -(originY + row * step - megatonCenter.Y) * WorldScale;
+                    colVerts[idx] = new Vector3(godotX, godotY, godotZ);
+                }
+            }
             var faceVerts = new Vector3[totalIndices];
             for (int i = 0; i < totalIndices; i++)
-                faceVerts[i] = verts[indices[i]];
+                faceVerts[i] = colVerts[indices[i]];
             var collisionShape = new ConcavePolygonShape3D();
             collisionShape.SetFaces(faceVerts);
 
@@ -619,7 +628,7 @@ namespace OpenFo3.World
                     int idx = r * lodGridSize + c;
 
                     float godotX = (originX + srcC * step - megatonCenter.X) * WorldScale;
-                    float godotY = (hCenter + (heights[srcR, srcC] - hCenter) * HeightExaggeration) * HeightScale;
+                    float godotY = (hCenter + (heights[srcR, srcC] - hCenter) * _heightExaggeration) * HeightScale;
                     float godotZ = -(originY + srcR * step - megatonCenter.Y) * WorldScale;
 
                     verts[idx] = new Vector3(godotX, godotY, godotZ);

@@ -23,6 +23,8 @@ namespace OpenFo3.ESM
         public long Offset;
         public uint WorldFormId;
         public uint CellFormId;
+        public int CellX;
+        public int CellY;
     }
 
     public class ESMReader : IDisposable
@@ -93,14 +95,13 @@ namespace OpenFo3.ESM
                     // Non-GRUP record
                     uint flags = _reader.ReadUInt32();
                     uint formId = _reader.ReadUInt32();
-                    
                     if (targetSet.Contains(type))
                     {
                         index[formId] = new RecordEntry 
                         { 
                             Offset = startOffset,
                             WorldFormId = currentWorld,
-                            CellFormId = currentCell
+                            CellFormId = currentCell,
                         };
                     }
                     
@@ -220,6 +221,90 @@ namespace OpenFo3.ESM
                 }
             }
             return subRecords;
+        }
+
+        /// Build a map from LAND formId → (cellX, cellY) by sequentially scanning the
+        /// target WRLD's children in file order. This ensures each LAND gets the coordinates
+        /// of the CELL that immediately precedes it in the tree.
+        public Dictionary<uint, (int, int)> BuildLandCoordinateMap(
+            Dictionary<uint, RecordEntry> landIndex,
+            Dictionary<uint, RecordEntry> cellIndex,
+            uint worldFormId)
+        {
+            var coordMap = new Dictionary<uint, (int, int)>();
+
+            lock (_lock)
+            {
+                _stream.Position = 0;
+                TraverseForLandCoords(_stream.Length, landIndex, cellIndex, worldFormId, coordMap, 0, 0, 0);
+            }
+
+            return coordMap;
+        }
+
+        private void TraverseForLandCoords(long end, Dictionary<uint, RecordEntry> landIndex,
+            Dictionary<uint, RecordEntry> cellIndex, uint worldFormId,
+            Dictionary<uint, (int, int)> coordMap, uint currentWorld, int lastCellX, int lastCellY)
+        {
+            while (_stream.Position < end && _stream.Position < _stream.Length)
+            {
+                long startOffset = _stream.Position;
+                if (startOffset + 8 > _stream.Length) break;
+
+                string type = ReadTag();
+                uint size = _reader.ReadUInt32();
+
+                if (type == "GRUP")
+                {
+                    uint label = _reader.ReadUInt32();
+                    uint groupType = _reader.ReadUInt32();
+                    uint nextWorld = currentWorld;
+
+                    if (groupType == 1) // World Children
+                        nextWorld = label;
+
+                    long grupEnd = startOffset + size;
+                    if (grupEnd > _stream.Length) grupEnd = _stream.Length;
+
+                    _stream.Seek(8, SeekOrigin.Current);
+                    TraverseForLandCoords(grupEnd, landIndex, cellIndex, worldFormId,
+                        coordMap, nextWorld, lastCellX, lastCellY);
+                    _stream.Position = grupEnd;
+                }
+                else
+                {
+                    uint flags = _reader.ReadUInt32();
+                    uint formId = _reader.ReadUInt32();
+                    long dataPos = startOffset + 24;
+
+                    if (currentWorld == worldFormId)
+                    {
+                        if (type == "CELL")
+                        {
+                            // Read XCLC via GetSubRecords for reliability
+                            var cellRecord = GetRecordAtOffset(startOffset);
+                            var subs = GetSubRecords(cellRecord);
+                            foreach (var sub in subs)
+                            {
+                                if (sub.Type == "XCLC" && sub.Data.Length >= 8)
+                                {
+                                    lastCellX = BitConverter.ToInt32(sub.Data, 0);
+                                    lastCellY = BitConverter.ToInt32(sub.Data, 4);
+                                    break;
+                                }
+                            }
+                        }
+                        else if (type == "LAND" && landIndex.ContainsKey(formId))
+                        {
+                            coordMap[formId] = (lastCellX, lastCellY);
+                        }
+                    }
+
+                    long nextOffset = startOffset + 24 + size;
+                    if (nextOffset > _stream.Length) break;
+                    _stream.Position = nextOffset;
+                }
+            }
         }
 
         private string ReadTag()
