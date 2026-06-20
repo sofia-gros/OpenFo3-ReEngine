@@ -69,19 +69,27 @@ NIF 内の bhk\* 物理ブロックからの衝突形状生成。
 ## 5. ちらつき/描画問題
 
 - [x] カメラ回転時のメッシュの見え/見えのちらつき（原因: メッシュの向きが不正）
-- [ ] **ちらつきが直らない問題**（#12）
-  - 根本原因の特定と修正
-  - NIF→Godot 座標変換の再検証 (この修正は現在メガトンの外壁は完璧なのに街中の建築物の回転が違う問題を解決しなければならない。外壁の向きは完璧なので、ほかの要因が関係していそう)
-  - 三角形の向き（フロント/バックフェイス）の確認
+- [x] **メッシュ向きバグの根本原因を特定**（Flags フィールド読み取り誤り）
+  - 原因: `NIFBlockResolver.cs` で NiAVObject の `Flags` を uint16(2byte) で読んでいた（本来は uint32/4byte）
+  - 2byte のシフトが発生し Translation/Rotation/Scale がすべて破損していた
+  - PyFFI (pyffi.formats.nif.NifFormat) 基準 + 全ブロック余り=0 で uint32 を確定
+  - 修正: `NIFBlockResolver.cs:374` を `br.ReadUInt32()` に復元
+- [-] **Redot 上での向き検証**（#12）
+  - 外壁の向きは完璧だが街中の建築物の回転が合わない問題が残存
+  - REFR 回転コード（`Megaton.cs` CreateAndAddInstance）を改訂済み: Up(-rz) → Forward(ry) → Right(rx) の順
+  - NIF→Godot 座標変換は numpy + PyFFI で検証済み（相似変換 R_conv @ R_fo3 @ R_conv^-1）
+  - 三角形の向き（フロント/バックフェイス）の確認は未実施
 
 ## 6. ワールド/セル読み込み
 
 - [x] ESM パース（GRUP 階層、圧縮レコード、FormId インデックス）
 - [x] BSA アーカイブ読み込み（v104/v105, ZLib 展開）
-- [x] NIF モデル解析（バージョン 20.2.0.7）
-- [x] NIF ブロック階層解決
+- [x] NIF モデル解析（バージョン 20.2.0.7, userVer=11, bsHeader=0x22）
+- [x] NIF ブロック階層解決（NiNode/NiGeometry/BSFadeNode/BSProperty 系を完全対応）
+- [x] **NiAVObject Flags = uint32 を確定**（PyFFI 基準で検証）
 - [x] ジオメトリ抽出（NiTriStripsData, NiTriShapeData）
 - [x] 座標変換（FO3: XYZ → Godot: XZ-Y, WorldScale=0.015）
+- [x] NIF 頂点変換の数学的検証（`NIFMeshBuilder.cs` R_conv @ R_fo3, numpy で証明）
 - [x] 非同期ワールドローディング（Parallel.ForEach + \_Process queue）
 - [x] メッシュ/テクスチャ/NIF キャッシング
 - [ ] STAT/DOOR 以外のレコードタイプ対応
@@ -158,7 +166,7 @@ NIF 内の bhk\* 物理ブロックからの衝突形状生成。
 1. **高優先度** - レンダリングの完全性
    - メガトンの地面がない問題（#10）
    - ライトの向きが正しくない問題（#11）
-   - ちらつきが直らない問題（#12）
+   - **街中の建築物の向きが合わない問題**（#12）— Flags uint32 修正後に Redot で再検証が必要
    - ノーマルマップ/スペキュラーマップの完全対応
 
 2. **中優先度** - 拡張
@@ -172,3 +180,16 @@ NIF 内の bhk\* 物理ブロックからの衝突形状生成。
    - サウンド
    - アニメーション
    - クエスト
+
+---
+
+## 最近の変更履歴
+
+### メッシュ向きバグ調査（直近セッション）
+- **根本原因を特定**: `NIFBlockResolver.cs:374` の `Flags` が uint16 で読まれていた（正しくは uint32）
+- AI アシスタント（Claude）が uint32 → uint16 に誤って変更し、2byte シフトで全 NiAVObject の Translation/Rotation/Scale が破損
+- PyFFI で 3 つの NIF ファイル（`generichangingwire01.nif` 含む）を基準に検証 → 常に uint32 で余り=0 になることを確認
+- `AI/verify_flags.py`, `verify_refr_math.py`, `verify_refr_math2.py`, `verify_full_pipeline.py` で数式を証明
+- 修正後ビルド成功（0 エラー / 0 警告）
+- **残課題**: Redot 上でメガトン街中の建築物の回転が合っているか視覚検証する（外壁は完璧）
+- 補足: REFR 回転コード（`Megaton.cs` CreateAndAddInstance）は相似変換として数学的に正しいことを確認済み
