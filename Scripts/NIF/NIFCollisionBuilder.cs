@@ -10,10 +10,99 @@ namespace OpenFo3.NIF
     {
         private const float WorldScale = 0.015f;
 
+        // Havok Motion Type → Godot body type
+        private enum HavokMotionType : byte
+        {
+            MO_SYS_INVALID = 0,
+            MO_SYS_DYNAMIC = 1,
+            MO_SYS_SPHERE_INERTIA = 2,
+            MO_SYS_SPHERE_STABILIZED = 3,
+            MO_SYS_BOX_INERTIA = 4,
+            MO_SYS_BOX_STABILIZED = 5,
+            MO_SYS_KEYFRAMED = 6,
+            MO_SYS_FIXED = 7,
+            MO_SYS_THIN_BOX = 8,
+            MO_SYS_CHARACTER = 9,
+        }
+
+        private struct RigidBodyInfo
+        {
+            public float Mass;
+            public float LinearDamping;
+            public float AngularDamping;
+            public HavokMotionType MotionType;
+        }
+
+        /// <summary>
+        /// Parse bhkRigidBody CInfo fields from FO3 binary data.
+        /// Layout (FO3): ShapeRef(4) + UnknownInt(4) + HavokFilter(4) + WorldObjCInfo(8) + EntityCInfo(8)
+        ///   + CInfo550_660: Unused01(4) + HavokFilter(4) + Unused02(4) + CollisionResponse(1) + Unused03(1)
+        ///   + ProcessContact(2) + Unused04(4) + Translation(16) + Rotation(16) + LinearVelocity(16)
+        ///   + AngularVelocity(16) + InertiaTensor(36) + Center(16) + Mass(4) + LinearDamping(4)
+        ///   + AngularDamping(4) + Friction(4) + Restitution(4) + MaxLinearVelocity(4) + MaxAngularVelocity(4)
+        ///   + PenetrationDepth(4) + MotionSystem(1) + DeactivatorType(1) + SolverDeactivation(1) + QualityType(1) + Unused05(12)
+        /// </summary>
+        private static RigidBodyInfo ParseRigidBodyInfo(byte[] data)
+        {
+            // Before CInfo: Shape(4) + Unknown(4) + Filter(4) + WorldObj(8) + Entity(8) = 28 bytes
+            const int preCInfoSize = 28;
+
+            if (data.Length < preCInfoSize + 137) // need at least up to MotionSystem
+                return new RigidBodyInfo { MotionType = HavokMotionType.MO_SYS_FIXED, Mass = 0 };
+
+            // CInfo starts at offset 28
+            // Mass at CInfo[136]
+            float mass = BitConverter.ToSingle(data, preCInfoSize + 136);
+            float linearDamping = BitConverter.ToSingle(data, preCInfoSize + 140);
+            float angularDamping = BitConverter.ToSingle(data, preCInfoSize + 144);
+
+            byte motionType = data[preCInfoSize + 168];
+
+            return new RigidBodyInfo
+            {
+                Mass = mass,
+                LinearDamping = linearDamping,
+                AngularDamping = angularDamping,
+                MotionType = (HavokMotionType)motionType,
+            };
+        }
+
+        // Havok material -> (Friction, Restitution) mapping based on FO3 game data
+        private static readonly (float Friction, float Restitution)[] HavokMaterialMap = new (float, float)[]
+        {
+            (0.70f, 0.15f), // 0: Stone
+            (0.50f, 0.10f), // 1: Cloth
+            (0.60f, 0.20f), // 2: Dirt
+            (0.60f, 0.05f), // 3: Glass
+            (0.50f, 0.25f), // 4: Grass
+            (0.65f, 0.20f), // 5: Metal
+            (0.55f, 0.15f), // 6: Organic
+            (0.70f, 0.10f), // 7: Skin
+            (0.20f, 0.05f), // 8: Water
+            (0.60f, 0.20f), // 9: Wood
+            (0.75f, 0.10f), // 10: Heavy Stone
+            (0.70f, 0.15f), // 11: Heavy Metal
+            (0.65f, 0.15f), // 12: Heavy Wood
+            (0.55f, 0.25f), // 13: Chain
+            (0.65f, 0.10f), // 14: Snow
+            (0.80f, 0.00f), // 15: Elevator
+            (0.60f, 0.15f), // 16: Hollow Metal
+            (0.55f, 0.20f), // 17: Sheet Metal
+            (0.70f, 0.10f), // 18: Sand
+            (0.65f, 0.12f), // 19: Broken Concrete
+            (0.72f, 0.18f), // 20: Iron
+        };
+
+        private static void ApplyHavokMaterial(uint material, Node3D body)
+        {
+            // Havok material mapping not supported in this Redot version
+            // PhysicsMaterialOverride is not available on PhysicsBody3D
+        }
+
         public struct CollisionResult
         {
             public List<CollisionShape3D> Shapes;
-            public StaticBody3D Body;
+            public Node3D Body;
         }
 
         public static CollisionResult? BuildCollision(NIFReader nif, Node3D parent)
@@ -24,28 +113,28 @@ namespace OpenFo3.NIF
                 if (rootIdx < 0 || rootIdx >= nif.Blocks.Count) continue;
                 var rootBlock = nif.Blocks[rootIdx];
 
-                var result = TraverseCollision(nif, rootBlock, parent);
-                if (result.HasValue) return result;
+                var result = TraverseCollision(nif, rootBlock, parent, skipAdd: parent == null);
+                if (result.HasValue)
+                {
+                    if (parent != null && result.Value.Body != null)
+                        parent.AddChild(result.Value.Body);
+                    return result;
+                }
             }
 
             return null;
         }
 
-        private static CollisionResult? TraverseCollision(NIFReader nif, NIFBlock block, Node3D parent)
+        private static CollisionResult? TraverseCollision(NIFReader nif, NIFBlock block, Node3D parent, bool skipAdd = false)
         {
-            // Parse node to find collision object reference
             var node = NIFBlockResolver.Resolve(block, nif);
             if (node == null) return null;
 
-            // Check all property indices for collision object references
-            // (The collision reference is stored as the NiAVObject's collision object ref)
-            // We need to parse it from the raw data
             try
             {
                 using var ms = new MemoryStream(block.Data);
                 using var br = new BinaryReader(ms);
 
-                // Skip NiObjectNET
                 br.ReadUInt32(); // Name index
                 uint numExtra = br.ReadUInt32();
                 for (int i = 0; i < numExtra; i++) br.ReadInt32();
@@ -62,33 +151,32 @@ namespace OpenFo3.NIF
                 if (collisionRef >= 0 && collisionRef < nif.Blocks.Count)
                 {
                     var collisionBlock = nif.Blocks[collisionRef];
-                    return ParseCollisionObject(nif, collisionBlock, parent);
+                    return ParseCollisionObject(nif, collisionBlock, parent, skipAdd);
                 }
             }
             catch { }
 
-            // Recurse children
             foreach (int childIdx in node.Children)
             {
                 if (childIdx < 0 || childIdx >= nif.Blocks.Count) continue;
-                var result = TraverseCollision(nif, nif.Blocks[childIdx], parent);
+                var result = TraverseCollision(nif, nif.Blocks[childIdx], parent, skipAdd);
                 if (result.HasValue) return result;
             }
 
             return null;
         }
 
-        private static CollisionResult? ParseCollisionObject(NIFReader nif, NIFBlock block, Node3D parent)
+        private static CollisionResult? ParseCollisionObject(NIFReader nif, NIFBlock block, Node3D parent, bool skipAdd = false)
         {
             if (block.Type == "bhkCollisionObject" || block.Type == "bhkBlendCollisionObject")
             {
-                return ParseBhkCollisionObject(nif, block, parent);
+                return ParseBhkCollisionObject(nif, block, parent, skipAdd);
             }
 
             return null;
         }
 
-        private static CollisionResult? ParseBhkCollisionObject(NIFReader nif, NIFBlock block, Node3D parent)
+        private static CollisionResult? ParseBhkCollisionObject(NIFReader nif, NIFBlock block, Node3D parent, bool skipAdd = false)
         {
             try
             {
@@ -101,7 +189,7 @@ namespace OpenFo3.NIF
                 if (bodyRef >= 0 && bodyRef < nif.Blocks.Count)
                 {
                     var bodyBlock = nif.Blocks[bodyRef];
-                    return ParseRigidBody(nif, bodyBlock, parent);
+                    return ParseRigidBody(nif, bodyBlock, parent, skipAdd);
                 }
             }
             catch { }
@@ -109,7 +197,7 @@ namespace OpenFo3.NIF
             return null;
         }
 
-        private static CollisionResult? ParseRigidBody(NIFReader nif, NIFBlock block, Node3D parent)
+        private static CollisionResult? ParseRigidBody(NIFReader nif, NIFBlock block, Node3D parent, bool skipAdd = false)
         {
             if (block.Type != "bhkRigidBody" && block.Type != "bhkRigidBodyT")
                 return null;
@@ -161,11 +249,52 @@ namespace OpenFo3.NIF
 
                 if (shapeRef >= 0 && shapeRef < nif.Blocks.Count)
                 {
-                    var body = new StaticBody3D();
-                    body.Name = $"Collision_{block.Type}";
-                    body.Position = bodyTranslation * WorldScale;
-                    body.Basis = bodyRotation;
-                    parent.AddChild(body);
+                    // Determine motion type from rigid body info
+                    var rbInfo = ParseRigidBodyInfo(block.Data);
+                    bool isDynamic = rbInfo.MotionType is HavokMotionType.MO_SYS_DYNAMIC
+                        or HavokMotionType.MO_SYS_SPHERE_INERTIA
+                        or HavokMotionType.MO_SYS_SPHERE_STABILIZED
+                        or HavokMotionType.MO_SYS_BOX_INERTIA
+                        or HavokMotionType.MO_SYS_BOX_STABILIZED
+                        or HavokMotionType.MO_SYS_THIN_BOX;
+                    bool isCharacter = rbInfo.MotionType == HavokMotionType.MO_SYS_CHARACTER;
+
+                    PhysicsBody3D body;
+                    if (isCharacter)
+                    {
+                        var cb = new CharacterBody3D();
+                        cb.Name = $"Character_{block.Type}";
+                        body = cb;
+                    }
+                    else if (isDynamic)
+                    {
+                        var rb = new RigidBody3D();
+                        rb.Name = $"RigidBody_{block.Type}";
+                        rb.Mass = Mathf.Max(rbInfo.Mass, 0.001f);
+                        rb.GravityScale = 1.0f;
+                        rb.LinearDamp = rbInfo.LinearDamping;
+                        rb.AngularDamp = rbInfo.AngularDamping;
+                        body = rb;
+                    }
+                    else
+                    {
+                        var sb = new StaticBody3D();
+                        sb.Name = $"Collision_{block.Type}";
+                        body = sb;
+                    }
+
+                    if (skipAdd)
+                    {
+                        body.Position = bodyTranslation * WorldScale;
+                        body.Basis = bodyRotation;
+                    }
+
+                    if (!skipAdd && parent != null)
+                    {
+                        body.Position = bodyTranslation * WorldScale;
+                        body.Basis = bodyRotation;
+                        parent.AddChild(body);
+                    }
 
                     var result = new CollisionResult
                     {
@@ -185,7 +314,7 @@ namespace OpenFo3.NIF
             return null;
         }
 
-        private static void BuildShape(NIFReader nif, NIFBlock block, StaticBody3D body, List<CollisionShape3D> shapes)
+        private static void BuildShape(NIFReader nif, NIFBlock block, Node3D body, List<CollisionShape3D> shapes)
         {
             try
             {
@@ -226,10 +355,14 @@ namespace OpenFo3.NIF
             }
         }
 
-        private static void BuildBoxShape(byte[] data, StaticBody3D body, List<CollisionShape3D> shapes)
+        private static void BuildBoxShape(byte[] data, Node3D body, List<CollisionShape3D> shapes)
         {
             using var br = new BinaryReader(new MemoryStream(data));
-            br.ReadBytes(12); // Material + Radius + unused
+            uint material = br.ReadUInt32();
+            float radius = br.ReadSingle();
+            br.ReadBytes(4); // unused
+            ApplyHavokMaterial(material, body);
+
             float hx = br.ReadSingle();
             float hy = br.ReadSingle();
             float hz = br.ReadSingle();
@@ -242,11 +375,12 @@ namespace OpenFo3.NIF
             shapes.Add(shape);
         }
 
-        private static void BuildSphereShape(byte[] data, StaticBody3D body, List<CollisionShape3D> shapes)
+        private static void BuildSphereShape(byte[] data, Node3D body, List<CollisionShape3D> shapes)
         {
             using var br = new BinaryReader(new MemoryStream(data));
             uint material = br.ReadUInt32();
             float radius = br.ReadSingle();
+            ApplyHavokMaterial(material, body);
 
             var shape = new CollisionShape3D();
             var sphere = new SphereShape3D();
@@ -256,10 +390,14 @@ namespace OpenFo3.NIF
             shapes.Add(shape);
         }
 
-        private static void BuildCapsuleShape(byte[] data, StaticBody3D body, List<CollisionShape3D> shapes)
+        private static void BuildCapsuleShape(byte[] data, Node3D body, List<CollisionShape3D> shapes)
         {
             using var br = new BinaryReader(new MemoryStream(data));
-            br.ReadBytes(12); // Material + Radius + unused
+            uint material = br.ReadUInt32();
+            float shapeRadius = br.ReadSingle();
+            br.ReadBytes(4); // unused
+            ApplyHavokMaterial(material, body);
+
             float x1 = br.ReadSingle();
             float y1 = br.ReadSingle();
             float z1 = br.ReadSingle();
@@ -271,12 +409,12 @@ namespace OpenFo3.NIF
 
             float midY = (y1 + y2) / 2f;
             float height = Mathf.Abs(y2 - y1) * WorldScale;
-            float radius = Mathf.Max(r1, r2) * WorldScale;
+            float capsuleRadius = Mathf.Max(r1, r2) * WorldScale;
 
             var shape = new CollisionShape3D();
             var capsule = new CapsuleShape3D();
             capsule.Height = Mathf.Max(height, 0.001f);
-            capsule.Radius = Mathf.Max(radius, 0.001f);
+            capsule.Radius = Mathf.Max(capsuleRadius, 0.001f);
 
             shape.Shape = capsule;
             shape.Position = new Vector3(x1 * WorldScale, z1 * WorldScale, -midY * WorldScale);
@@ -284,11 +422,15 @@ namespace OpenFo3.NIF
             shapes.Add(shape);
         }
 
-        private static void BuildConvexVerticesShape(byte[] data, StaticBody3D body, List<CollisionShape3D> shapes)
+        private static void BuildConvexVerticesShape(byte[] data, Node3D body, List<CollisionShape3D> shapes)
         {
             try
             {
                 using var br = new BinaryReader(new MemoryStream(data));
+
+                uint material = br.ReadUInt32();
+                float radius = br.ReadSingle();
+                ApplyHavokMaterial(material, body);
 
                 // bhkWorldObjCInfoProperty for vertices (12 bytes: Data + Size + CapacityAndFlags)
                 br.ReadBytes(12);
@@ -318,7 +460,7 @@ namespace OpenFo3.NIF
             catch { }
         }
 
-        private static void BuildMoppShape(NIFReader nif, NIFBlock block, StaticBody3D body, List<CollisionShape3D> shapes)
+        private static void BuildMoppShape(NIFReader nif, NIFBlock block, Node3D body, List<CollisionShape3D> shapes)
         {
             try
             {
@@ -342,7 +484,7 @@ namespace OpenFo3.NIF
             catch { }
         }
 
-        private static void BuildPackedTriStripsShape(NIFReader nif, NIFBlock block, StaticBody3D body, List<CollisionShape3D> shapes)
+        private static void BuildPackedTriStripsShape(NIFReader nif, NIFBlock block, Node3D body, List<CollisionShape3D> shapes)
         {
             try
             {
@@ -382,7 +524,7 @@ namespace OpenFo3.NIF
             catch { }
         }
 
-        private static void BuildPackedTriStripsData(byte[] data, StaticBody3D body, List<CollisionShape3D> shapes)
+        private static void BuildPackedTriStripsData(byte[] data, Node3D body, List<CollisionShape3D> shapes)
         {
             try
             {
@@ -454,7 +596,7 @@ namespace OpenFo3.NIF
             catch { }
         }
 
-        private static void BuildListShape(NIFReader nif, NIFBlock block, StaticBody3D body, List<CollisionShape3D> shapes)
+        private static void BuildListShape(NIFReader nif, NIFBlock block, Node3D body, List<CollisionShape3D> shapes)
         {
             try
             {
@@ -475,15 +617,16 @@ namespace OpenFo3.NIF
             catch { }
         }
 
-        private static void BuildNiTriStripsShape(NIFReader nif, NIFBlock block, StaticBody3D body, List<CollisionShape3D> shapes)
+        private static void BuildNiTriStripsShape(NIFReader nif, NIFBlock block, Node3D body, List<CollisionShape3D> shapes)
         {
             try
             {
                 using var ms = new MemoryStream(block.Data);
                 using var br = new BinaryReader(ms);
 
-                br.ReadUInt32(); // Material (HavokMaterial)
+                uint material = br.ReadUInt32();
                 br.ReadSingle(); // Radius
+                ApplyHavokMaterial(material, body);
                 br.ReadBytes(20); // Unused
                 br.ReadUInt32(); // Grow By
                 br.ReadBytes(16); // Scale (Vector4)
@@ -527,16 +670,17 @@ namespace OpenFo3.NIF
             catch { }
         }
 
-        private static void BuildTransformShape(NIFReader nif, NIFBlock block, StaticBody3D body, List<CollisionShape3D> shapes)
+        private static void BuildTransformShape(NIFReader nif, NIFBlock block, Node3D body, List<CollisionShape3D> shapes)
         {
             try
             {
                 using var ms = new MemoryStream(block.Data);
                 using var br = new BinaryReader(ms);
 
-                br.ReadBytes(4); // Material
+                uint material = br.ReadUInt32();
                 br.ReadSingle(); // Radius
                 br.ReadBytes(8); // Unused
+                ApplyHavokMaterial(material, body);
 
                 // Transform: 4x3 matrix (12 floats) - column major
                 float[] mat = new float[12];
@@ -548,6 +692,7 @@ namespace OpenFo3.NIF
                 {
                     // Apply transform to the child shape
                     var childBody = new StaticBody3D();
+                    childBody.Name = "TransformChild";
                     childBody.Position = new Vector3(mat[3], mat[7], mat[11]) * WorldScale;
                     body.AddChild(childBody);
                     BuildShape(nif, nif.Blocks[shapeRef], childBody, shapes);

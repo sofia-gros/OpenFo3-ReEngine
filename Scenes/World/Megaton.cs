@@ -16,6 +16,14 @@ public partial class Megaton : Node3D
 	private ConcurrentDictionary<string, ArrayMesh> _meshCache = new();
 	private ConcurrentDictionary<string, NIFReader> _nifCache = new();
 	private ConcurrentDictionary<string, Texture2D> _textureCache = new();
+	private ConcurrentDictionary<string, List<ParticleSystemEntry>> _particleCache = new();
+	private ConcurrentDictionary<string, List<Node3D>> _skinnedCache = new();
+
+	private Dictionary<string, Stack<MeshInstance3D>> _meshPool = new();
+	private Dictionary<string, Stack<Node3D>> _propPool = new();
+	private Dictionary<string, List<PropEntry>> _propEntries = new();
+	private Camera3D _cachedCamera;
+	private const float PropLodDistance = 80f;
 
 	private List<BSAReader> _bsaReaders = new();
 	private BSAReader _texturesBsa;
@@ -32,6 +40,7 @@ public partial class Megaton : Node3D
 	private ConcurrentQueue<InstanceRequest> _instantiateQueue = new();
 	private LightingLoader _lightingLoader;
 	private TerrainBuilder _terrainBuilder;
+	private NavMeshBuilder _navMeshBuilder;
 
 	private struct InstanceRequest
 	{
@@ -63,6 +72,27 @@ public partial class Megaton : Node3D
 	private Label3D _worldLabel;
 	private bool _initialized = false;
 
+	private struct TerrainLodEntry
+	{
+		public MeshInstance3D Instance;
+		public ArrayMesh FullMesh;
+		public ArrayMesh LodMesh;
+	}
+	private Dictionary<string, List<TerrainLodEntry>> _terrainLodEntries = new();
+	private const float LodDistance = 60f;
+
+	private struct PropEntry
+	{
+		public MeshInstance3D MeshInstance;
+		public Node3D Parent;
+		public Vector3 Position;
+		public float BoundingRadius;
+		public string NifPath;
+		public ArrayMesh FullMesh;
+		public ArrayMesh LodMesh;
+		public bool Valid;
+	}
+
 	private const float CellSize = 4096f;
 	private const int MinTerrainHalf = 10;
 
@@ -74,6 +104,58 @@ public partial class Megaton : Node3D
 		for (int i = 0; i < MaxPerFrame && _instantiateQueue.TryDequeue(out var req); i++)
 		{
 			CreateAndAddInstance(req);
+		}
+
+		UpdateDebugOverlay();
+	}
+
+	private void UpdateDebugOverlay()
+	{
+		if (_debugLabel == null) return;
+
+		double fps = Engine.GetFramesPerSecond();
+		int pending = _instantiateQueue.Count;
+		int meshesCached = _meshCache.Count;
+		int texturesCached = _textureCache.Count;
+		int nifsCached = _nifCache.Count;
+
+		string worldInfo = _currentWorldName ?? "(none)";
+		int worldIdx = _worldNameList.IndexOf(_currentWorldName ?? "");
+
+		Vector3 camPos = Vector3.Zero;
+		var cam = GetViewport()?.GetCamera3D();
+		if (cam != null) camPos = cam.GlobalPosition;
+
+		_debugLabel.Text = $"OpenFo3: ReEngine  |  F1-F9: Switch World\n" +
+			$"FPS: {fps,4:F0}  |  World [{worldIdx + 1}]: {worldInfo}\n" +
+			$"Queued: {pending}  |  Meshes: {meshesCached}  |  Textures: {texturesCached}  |  NIFs: {nifsCached}\n" +
+			$"Camera: ({camPos.X:F1}, {camPos.Y:F1}, {camPos.Z:F1})";
+	}
+
+	private void UpdateTerrainLod()
+	{
+		if (_currentWorldName == null) return;
+		if (!_terrainLodEntries.TryGetValue(_currentWorldName, out var entries)) return;
+
+		var cam = GetViewport()?.GetCamera3D();
+		if (cam == null) return;
+
+		Vector3 camPos = cam.GlobalPosition;
+		float lodDistSq = LodDistance * LodDistance;
+
+		foreach (var entry in entries)
+		{
+			if (entry.Instance == null) continue;
+			if (entry.LodMesh == null) continue;
+
+			float distSq = entry.Instance.GlobalPosition.DistanceSquaredTo(camPos);
+			bool useLod = distSq > lodDistSq;
+			bool currentIsLod = entry.Instance.Mesh == entry.LodMesh;
+
+			if (useLod && !currentIsLod)
+				entry.Instance.Mesh = entry.LodMesh;
+			else if (!useLod && currentIsLod)
+				entry.Instance.Mesh = entry.FullMesh;
 		}
 	}
 
@@ -92,6 +174,8 @@ public partial class Megaton : Node3D
 			}
 		}
 	}
+
+	private Label _debugLabel;
 
 	public override async void _Ready()
 	{
@@ -114,7 +198,10 @@ public partial class Megaton : Node3D
 
 			_lightingLoader = new LightingLoader(_esm);
 			_terrainBuilder = new TerrainBuilder(_esm);
+			_terrainBuilder.SetLandIndex(_masterFormIDIndex);
+			_navMeshBuilder = new NavMeshBuilder(_esm);
 
+			CreateDebugOverlay();
 			DiscoverWorlds();
 
 			string targetWorld = GamePaths.GetTargetWorld();
@@ -136,6 +223,27 @@ public partial class Megaton : Node3D
 		{
 			GD.PrintErr($"[Megaton] Init error: {e.Message}");
 		}
+	}
+
+	private void CreateDebugOverlay()
+	{
+		var canvas = new CanvasLayer();
+		canvas.Name = "DebugOverlay";
+		canvas.Layer = 10;
+		AddChild(canvas);
+
+		_debugLabel = new Label();
+		_debugLabel.Name = "DebugLabel";
+		_debugLabel.Position = new Vector2(10, 10);
+		_debugLabel.HorizontalAlignment = HorizontalAlignment.Left;
+		_debugLabel.VerticalAlignment = VerticalAlignment.Top;
+		var settings = new LabelSettings();
+		settings.FontSize = 14;
+		settings.FontColor = new Color(0, 1, 0);
+		settings.OutlineSize = 1;
+		settings.OutlineColor = new Color(0, 0, 0);
+		_debugLabel.LabelSettings = settings;
+		canvas.AddChild(_debugLabel);
 	}
 
 	private void CreateWorldLabel()
@@ -314,6 +422,9 @@ public partial class Megaton : Node3D
 		// Load cell lighting (synchronous, main thread)
 		LoadCellLighting(wd, container);
 
+		// Load navmesh
+		LoadNavMesh(wd, container);
+
 		// Load REFRs on background thread
 		await Task.Run(() => LoadWorldRefrs(wd));
 
@@ -329,6 +440,8 @@ public partial class Megaton : Node3D
 				wd.DefaultLandHeight, wd.NwCellX, wd.NwCellY, wd.SeCellX, wd.SeCellY);
 			GD.Print($"[Megaton] World '{wd.Name}': loaded {tiles.Count} terrain tiles.");
 
+			var lodList = new List<TerrainLodEntry>();
+
 			foreach (var tile in tiles)
 			{
 				var name = $"Terrain_{tile.CellCoord.X}_{tile.CellCoord.Y}";
@@ -337,6 +450,13 @@ public partial class Megaton : Node3D
 				inst.Mesh = tile.Mesh;
 				inst.Name = name;
 				container.AddChild(inst);
+
+				lodList.Add(new TerrainLodEntry
+				{
+					Instance = inst,
+					FullMesh = tile.Mesh,
+					LodMesh = tile.LodMesh,
+				});
 
 				if (tile.CollisionShape != null)
 				{
@@ -348,6 +468,8 @@ public partial class Megaton : Node3D
 					container.AddChild(body);
 				}
 			}
+
+			_terrainLodEntries[wd.Name] = lodList;
 		}
 		catch (Exception e)
 		{
@@ -376,6 +498,49 @@ public partial class Megaton : Node3D
 		catch (Exception e)
 		{
 			GD.PrintErr($"[Megaton] Lighting load error for '{wd.Name}': {e.Message}");
+		}
+	}
+
+	private void LoadNavMesh(WorldData wd, Node3D container)
+	{
+		try
+		{
+			var navMeshes = _navMeshBuilder.GetNavMeshesForWorld(wd.FormId);
+			if (navMeshes.Count == 0)
+			{
+				GD.Print($"[Megaton] No navmeshes for world '{wd.Name}'");
+				return;
+			}
+
+			int totalVerts = 0, totalPolys = 0;
+			for (int i = 0; i < navMeshes.Count; i++)
+			{
+				var navData = navMeshes[i];
+				NavigationMesh navMesh;
+				try
+				{
+					navMesh = NavMeshBuilder.BuildNavigationMesh(navData, wd.Center, WorldScale);
+				}
+				catch
+				{
+					continue;
+				}
+				if (navMesh == null) continue;
+
+				var region = new NavigationRegion3D();
+				region.Name = $"NavMesh_{i}";
+				region.NavigationMesh = navMesh;
+				container.AddChild(region);
+				totalVerts += navData.Vertices.Length;
+				totalPolys += navData.Triangles.Length;
+			}
+
+			GD.Print($"[Megaton] Built {navMeshes.Count} navmesh regions for '{wd.Name}': " +
+				$"{totalVerts} verts, {totalPolys} polys");
+		}
+		catch (Exception e)
+		{
+			GD.PrintErr($"[Megaton] NavMesh load error for '{wd.Name}': {e.Message}");
 		}
 	}
 
@@ -657,6 +822,8 @@ public partial class Megaton : Node3D
 			_worldLabel.Text = $"World [{idx + 1}]: {worldName}";
 		}
 
+		_cachedCamera = null;
+
 		GD.Print($"[Megaton] Now showing world: {worldName}");
 	}
 
@@ -673,29 +840,118 @@ public partial class Megaton : Node3D
 		}
 
 		MeshInstance3D inst = null;
+		Node3D physicsBody = null;
 
 		if (!string.IsNullOrEmpty(req.Path))
 		{
 			var mesh = GetOrBuildMesh(req.Path);
-			if (mesh == null && req.BaseType != "LIGH") return;
 
-			if (mesh != null)
+			// Check for skinned node hierarchy (skeleton + skinned meshes)
+			if (_skinnedCache.TryGetValue(req.Path, out var skinnedNodes) && skinnedNodes.Count > 0)
 			{
-				inst = new MeshInstance3D { Mesh = mesh };
+				var basis = Basis.Identity;
+				basis = basis.Rotated(Vector3.Up,      -req.Rotation.Z);
+				basis = basis.Rotated(Vector3.Forward,  req.Rotation.Y);
+				basis = basis.Rotated(Vector3.Right,    req.Rotation.X);
+				basis = basis.Scaled(Vector3.One * req.Scale);
+				var transform = new Transform3D(basis, req.Position);
+
+				foreach (var srcNode in skinnedNodes)
+				{
+					var clone = CloneNodeTree(srcNode);
+					clone.Transform = transform;
+					container.AddChild(clone);
+					var meshInst = clone.FindChild("*", recursive: true) as MeshInstance3D;
+					if (meshInst != null)
+						TrackProp(meshInst, clone, req.Position, req.Path, meshInst.Mesh as ArrayMesh, null);
+				}
+			}
+			else if (mesh != null || req.BaseType == "LIGH")
+			{
+				if (mesh == null && req.BaseType != "LIGH") return;
 
 				var basis = Basis.Identity;
 				basis = basis.Rotated(Vector3.Up,      -req.Rotation.Z);
 				basis = basis.Rotated(Vector3.Forward,  req.Rotation.Y);
 				basis = basis.Rotated(Vector3.Right,    req.Rotation.X);
 				basis = basis.Scaled(Vector3.One * req.Scale);
+				var transform = new Transform3D(basis, req.Position);
 
-				inst.Transform = new Transform3D(basis, req.Position);
-				container.AddChild(inst);
-
-				if (_nifCache.TryGetValue(req.Path, out var nif))
+				if (mesh != null && _nifCache.TryGetValue(req.Path, out var nif))
 				{
-					NIFCollisionBuilder.BuildCollision(nif, inst);
+					var colResult = NIFCollisionBuilder.BuildCollision(nif, null);
+					if (colResult.HasValue)
+					{
+						physicsBody = colResult.Value.Body;
+						physicsBody.Name = $"Body_{req.FormId:X8}";
+						physicsBody.Transform = transform;
+
+						inst = RentMeshInstance(req.Path, mesh, Transform3D.Identity, null);
+						inst.Transform = Transform3D.Identity;
+						physicsBody.AddChild(inst);
+
+						container.AddChild(physicsBody);
+						TrackProp(inst, physicsBody, req.Position, req.Path, mesh, null);
+					}
 				}
+
+				if (inst == null && mesh != null)
+				{
+					inst = RentMeshInstance(req.Path, mesh, transform, container);
+					TrackProp(inst, null, req.Position, req.Path, mesh, null);
+				}
+			}
+		}
+
+		// Create particle systems from the NIF
+		if (!string.IsNullOrEmpty(req.Path) && _particleCache.TryGetValue(req.Path, out var particles))
+		{
+			var basis = Basis.Identity;
+			basis = basis.Rotated(Vector3.Up,      -req.Rotation.Z);
+			basis = basis.Rotated(Vector3.Forward,  req.Rotation.Y);
+			basis = basis.Rotated(Vector3.Right,    req.Rotation.X);
+			basis = basis.Scaled(Vector3.One * req.Scale);
+			var worldTransform = new Transform3D(basis, req.Position);
+
+			foreach (var pEntry in particles)
+			{
+				var gp = new GpuParticles3D();
+				var pm = new ParticleProcessMaterial();
+
+				// Apply particle system transform (NIF local + world)
+				var finalTransform = worldTransform * pEntry.Transform;
+				gp.Transform = finalTransform;
+
+				// Set texture from shader info
+				string texPath = pEntry.ShaderInfo?.TexturePaths != null && pEntry.ShaderInfo.TexturePaths.Length > 0
+					? pEntry.ShaderInfo.TexturePaths[0] : null;
+				if (!string.IsNullOrEmpty(texPath))
+				{
+					var tex = LoadTexture(texPath);
+					if (tex != null)
+					{
+						pm.Color = new Color(1, 1, 1, 1);
+					}
+				}
+
+				// Alpha handling
+				if (pEntry.AlphaInfo != null)
+				{
+					bool blend = (pEntry.AlphaInfo.Flags & 1) != 0;
+					if (blend)
+					{
+						gp.DrawPasses = 1;
+					}
+				}
+
+				gp.Amount = 64;
+				gp.Lifetime = 2.0;
+				gp.OneShot = false;
+				gp.Emitting = true;
+				gp.ProcessMaterial = pm;
+				gp.LocalCoords = false;
+
+				container.AddChild(gp);
 			}
 		}
 
@@ -745,6 +1001,23 @@ public partial class Megaton : Node3D
 		if (!_nifCache.TryGetValue(path, out var nif)) return null;
 
 		var geom = NIFMeshBuilder.ExtractGeometry(nif);
+
+		// Cache particle systems
+		if (geom.ParticleSystems.Count > 0)
+		{
+			_particleCache.TryAdd(path, geom.ParticleSystems);
+		}
+
+		// Build skeleton + skinned meshes if present
+		if (geom.SkinnedSurfaces.Count > 0 && geom.Skeleton != null)
+		{
+			var skinnedNodes = NIFMeshBuilder.BuildSkinned(geom, LoadTexture);
+			if (skinnedNodes.Count > 0)
+			{
+				_skinnedCache.TryAdd(path, skinnedNodes);
+			}
+		}
+
 		if (geom.Surfaces.Count == 0) return null;
 
 		var mesh = NIFMeshBuilder.BuildArrayMesh(geom);
@@ -768,7 +1041,8 @@ public partial class Megaton : Node3D
 						}
 					}
 
-					mat.RenderPriority = i;
+					if (mat.Transparency != BaseMaterial3D.TransparencyEnum.Disabled)
+						mat.RenderPriority = i;
 					mesh.SurfaceSetMaterial(i, mat);
 				}
 				else if (!string.IsNullOrEmpty(texPath))
@@ -837,5 +1111,131 @@ public partial class Megaton : Node3D
 		}
 
 		return null;
+	}
+
+	private Node3D CloneNodeTree(Node3D src)
+	{
+		var clone = (Node3D)src.Duplicate(7);
+		return clone;
+	}
+
+	private MeshInstance3D RentMeshInstance(string poolKey, ArrayMesh mesh, Transform3D transform, Node3D parent)
+	{
+		if (_meshPool.TryGetValue(poolKey, out var stack) && stack.Count > 0)
+		{
+			var inst = stack.Pop();
+			inst.Mesh = mesh;
+			inst.Visible = true;
+			inst.Transform = transform;
+			if (parent != null) parent.AddChild(inst);
+			return inst;
+		}
+		var newInst = new MeshInstance3D { Mesh = mesh };
+		newInst.Transform = transform;
+		parent?.AddChild(newInst);
+		return newInst;
+	}
+
+	private void ReturnMeshInstance(string poolKey, MeshInstance3D inst)
+	{
+		inst.GetParent()?.RemoveChild(inst);
+		inst.Visible = false;
+		if (!_meshPool.TryGetValue(poolKey, out var stack))
+		{
+			stack = new Stack<MeshInstance3D>();
+			_meshPool[poolKey] = stack;
+		}
+		stack.Push(inst);
+	}
+
+	private void TrackProp(MeshInstance3D meshInst, Node3D parent, Vector3 position,
+		string nifPath, ArrayMesh fullMesh, ArrayMesh lodMesh, float radius = 0f)
+	{
+		if (_currentWorldName == null) return;
+		if (!_propEntries.TryGetValue(_currentWorldName, out var list))
+		{
+			list = new List<PropEntry>();
+			_propEntries[_currentWorldName] = list;
+		}
+		list.Add(new PropEntry
+		{
+			MeshInstance = meshInst,
+			Parent = parent,
+			Position = position,
+			BoundingRadius = radius,
+			NifPath = nifPath,
+			FullMesh = fullMesh,
+			LodMesh = lodMesh,
+			Valid = true,
+		});
+	}
+
+	private void ReturnWorldPropsToPool(string worldName)
+	{
+		if (!_propEntries.TryGetValue(worldName, out var entries)) return;
+
+		foreach (var entry in entries)
+		{
+			if (!entry.Valid) continue;
+			if (entry.MeshInstance != null)
+			{
+				string key = entry.NifPath ?? "";
+				ReturnMeshInstance(key, entry.MeshInstance);
+			}
+		}
+		entries.Clear();
+	}
+
+	private void UpdateFrustumCulling()
+	{
+		if (_currentWorldName == null) return;
+		if (!_propEntries.TryGetValue(_currentWorldName, out var entries)) return;
+
+		var cam = GetCachedCamera();
+		if (cam == null) return;
+
+		foreach (var entry in entries)
+		{
+			if (!entry.Valid || entry.MeshInstance == null) continue;
+			bool inFrustum = cam.IsPositionInFrustum(entry.Position);
+			entry.MeshInstance.Visible = inFrustum;
+			if (entry.Parent != null && entry.Parent is StaticBody3D sb)
+				sb.Visible = inFrustum;
+		}
+	}
+
+	private void UpdatePropLod()
+	{
+		if (_currentWorldName == null) return;
+		if (!_propEntries.TryGetValue(_currentWorldName, out var entries)) return;
+
+		var cam = GetCachedCamera();
+		if (cam == null) return;
+		Vector3 camPos = cam.GlobalPosition;
+		float lodDistSq = PropLodDistance * PropLodDistance;
+
+		foreach (var entry in entries)
+		{
+			if (!entry.Valid || entry.MeshInstance == null) continue;
+			if (entry.LodMesh == null) continue;
+
+			float distSq = entry.Position.DistanceSquaredTo(camPos);
+			bool useLod = distSq > lodDistSq;
+			bool currentIsLod = entry.MeshInstance.Mesh == entry.LodMesh;
+
+			if (useLod && !currentIsLod)
+				entry.MeshInstance.Mesh = entry.LodMesh;
+			else if (!useLod && currentIsLod)
+				entry.MeshInstance.Mesh = entry.FullMesh;
+		}
+	}
+
+	private Camera3D GetCachedCamera()
+	{
+		if (_cachedCamera == null || !IsInstanceValid(_cachedCamera))
+		{
+			_cachedCamera = GetViewport()?.GetCamera3D();
+		}
+		return _cachedCamera;
 	}
 }

@@ -5,8 +5,6 @@ extends Camera3D
 @export var fast_speed_multiplier: float = 4.0
 
 func _ready():
-	# Make sure we don't start at zero if not desired, 
-	# but Megaton.cs will set our position.
 	pass
 
 func _input(event):

@@ -17,6 +17,7 @@ namespace OpenFo3.NIF
         public float RefractionStrength;
         public float ParallaxScale;
         public float ParallaxMaxPasses;
+        public uint BsVersion;
     }
 
     public class AlphaPropertyInfo
@@ -27,6 +28,12 @@ namespace OpenFo3.NIF
 
     public class NIFBlockResolver
     {
+        public class ParticleInfo
+        {
+            public bool WorldSpace;
+            public List<int> ModifierRefs = new();
+        }
+
         public class Node
         {
             public string Name;
@@ -39,6 +46,8 @@ namespace OpenFo3.NIF
             public List<int> PropertyIndices = new();
             public ShaderTextureInfo ShaderInfo;
             public AlphaPropertyInfo AlphaInfo;
+            public bool IsParticleSystem;
+            public ParticleInfo ParticleData;
         }
 
         public static Node Resolve(NIFBlock block, NIFReader nif)
@@ -54,7 +63,13 @@ namespace OpenFo3.NIF
                 }
                 else if (block.Type == "BSStripParticleSystem")
                 {
-                    return ParseNode(br, block.Index, block.Type, readNodeChildren: false);
+                    var node = ParseNode(br, block.Index, block.Type, isParticleSystem: true);
+                    if (node != null)
+                    {
+                        ResolveShaderProperty(node, nif);
+                        ResolveAlphaProperty(node, nif);
+                    }
+                    return node;
                 }
                 else if (block.Type == "NiTriShape" || block.Type == "NiTriStrips")
                 {
@@ -157,7 +172,8 @@ namespace OpenFo3.NIF
 
                 var info = new ShaderTextureInfo
                 {
-                    ShaderType = (int)shaderType,
+                    BsVersion = nif.BsVersion,
+                    ShaderType = TranslateFO3ShaderType((int)shaderType, nif.BsVersion),
                     ShaderFlags = shaderFlags,
                     ShaderFlags2 = shaderFlags2,
                     EnvironmentMapScale = envMapScale,
@@ -213,7 +229,8 @@ namespace OpenFo3.NIF
 
                 var info = new ShaderTextureInfo
                 {
-                    ShaderType = (int)shaderType,
+                    BsVersion = nif.BsVersion,
+                    ShaderType = TranslateFO3ShaderType((int)shaderType, nif.BsVersion),
                     ShaderFlags = shaderFlags,
                     ShaderFlags2 = shaderFlags2,
                 };
@@ -364,7 +381,7 @@ namespace OpenFo3.NIF
             return Encoding.ASCII.GetString(bytes).TrimEnd('\0');
         }
 
-        private static Node ParseNode(BinaryReader br, int blockIdx, string blockType, bool isGeometry = false, bool readNodeChildren = true)
+        private static Node ParseNode(BinaryReader br, int blockIdx, string blockType, bool isGeometry = false, bool readNodeChildren = true, bool isParticleSystem = false)
         {
             var node = new Node();
             long totalLen = br.BaseStream.Length;
@@ -402,7 +419,50 @@ namespace OpenFo3.NIF
             int collisionObject = br.ReadInt32();
 
             // 3. NiNode or NiGeometry fields
-            if (isGeometry)
+            if (isParticleSystem)
+            {
+                // NiParticleSystem inherits from NiGeometry in FO3.
+                // After NiAVObject: Data + SkinInstance + MaterialData,
+                // then NiParticleSystem-specific fields.
+                long pos = br.BaseStream.Position;
+                long remaining = br.BaseStream.Length - pos;
+
+                // FO3 (NI_BS_LTE_FO3): NiGeometry has Data + SkinInstance + MaterialData fields
+                // SSE+ (#BS_GTE_SSE#): NiParticleSystem has different layout
+                if (remaining >= 14)
+                {
+                    // Skip Data Ref (int32)
+                    br.ReadInt32();
+                    // Skip SkinInstance Ref (int32)
+                    br.ReadInt32();
+                    // MaterialData: NumMaterials(uint32) + MaterialName refs + ExtraData int32s + ActiveMaterial(int32) + NeedsUpdate(byte)
+                    uint numMaterials = br.ReadUInt32();
+                    for (int i = 0; i < numMaterials; i++) br.ReadInt32();
+                    for (int i = 0; i < numMaterials; i++) br.ReadInt32();
+                    br.ReadInt32(); // Active Material
+                    br.ReadByte();  // Material Needs Update
+                }
+
+                node.IsParticleSystem = true;
+                var pData = new ParticleInfo();
+
+                if (br.BaseStream.Position + 5 <= br.BaseStream.Length)
+                {
+                    pData.WorldSpace = br.ReadByte() != 0;
+                    uint numModifiers = br.ReadUInt32();
+                    if (numModifiers < 100)
+                    {
+                        for (int i = 0; i < numModifiers && br.BaseStream.Position + 4 <= br.BaseStream.Length; i++)
+                        {
+                            int modRef = br.ReadInt32();
+                            if (modRef != -1) pData.ModifierRefs.Add(modRef);
+                        }
+                    }
+                }
+
+                node.ParticleData = pData;
+            }
+            else if (isGeometry)
             {
                 node.DataIndex = br.ReadInt32();
 
@@ -429,6 +489,31 @@ namespace OpenFo3.NIF
             }
 
             return node;
+        }
+
+        public static int TranslateFO3ShaderType(int rawType, uint bsVersion)
+        {
+            // FO3 uses BSShaderType enum (0,1,10,14,15,17,29,32,33)
+            // Internal handlers use Skyrim BSLightingShaderType-style IDs or extended types.
+            // Translate FO3 types to canonical internal values so NIFMaterialBuilder
+            // produces correct material properties regardless of NIF version.
+            if (bsVersion <= 34)
+            {
+                switch (rawType)
+                {
+                    case 0:  return 34; // FO3 Tall Grass → TallGrass (34)
+                    case 1:  return 0;  // FO3 Default → Default (0)
+                    case 10: return 40; // FO3 Sky → internal Sky type
+                    case 14: return 31; // FO3 Skin → SkinTint (31)
+                    case 15: return 15; // FO3 Unknown/scolbld → keep (MultiLayerParallaxOcc)
+                    case 17: return 41; // FO3 Water → internal Water type
+                    case 29: return 0;  // FO3 Lighting30 → Default (0)
+                    case 32: return 0;  // FO3 Tiled → Default (0)
+                    case 33: return 42; // FO3 No Lighting → internal Unlit type
+                }
+            }
+            // Skyrim+ (bsver >= 35): values already match BSLightingShaderType, pass through
+            return rawType;
         }
     }
 }

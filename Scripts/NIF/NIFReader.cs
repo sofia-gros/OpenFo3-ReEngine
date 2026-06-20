@@ -12,6 +12,7 @@ namespace OpenFo3.NIF
         public List<int> RootBlockIndices = new List<int>();
         public List<string> Strings = new List<string>();
         public SkinDataStore SkinData = new SkinDataStore();
+        public uint BsVersion;
 
         public void Parse(byte[] data)
         {
@@ -33,6 +34,7 @@ namespace OpenFo3.NIF
                 //    (Author, ProcessScript, ExportScript)
                 //    FO3 20.2.0.7 bsver=34: always 3 export info strings
                 uint bsVersion = br.ReadUInt32();
+                BsVersion = bsVersion;
                 for (int i = 0; i < 3; i++)
                 {
                     byte len = br.ReadByte();

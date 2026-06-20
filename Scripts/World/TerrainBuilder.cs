@@ -30,11 +30,15 @@ namespace OpenFo3.World
         public TerrainBuilder(ESMReader esm)
         {
             _esm = esm;
-            _landIndex = esm.BuildFormIdIndex(new[] { "LAND" });
             _ltexIndex = esm.BuildFormIdIndex(new[] { "LTEX" });
             _cellIndex = esm.BuildFormIdIndex(new[] { "CELL" });
             _txstIndex = esm.BuildFormIdIndex(new[] { "TXST" });
             GD.Print($"[TerrainBuilder] LTEX index: {_ltexIndex.Count} entries, TXST index: {_txstIndex.Count} entries");
+        }
+
+        public void SetLandIndex(Dictionary<uint, RecordEntry> masterIndex)
+        {
+            _landIndex = masterIndex;
         }
 
         private string ResolveTexturePath(uint texFormId)
@@ -92,6 +96,7 @@ namespace OpenFo3.World
         public class TerrainTile
     {
         public ArrayMesh Mesh;
+        public ArrayMesh LodMesh;
         public Shape3D CollisionShape;
         public Vector2 CellCoord;
     }
@@ -560,12 +565,154 @@ namespace OpenFo3.World
             var collisionShape = new ConcavePolygonShape3D();
             collisionShape.SetFaces(faceVerts);
 
+            // Build LOD mesh (reduced resolution: every 4th vertex -> 9x9 grid)
+            ArrayMesh lodMesh = BuildLodTerrainMesh(heights, vclrColors, cellX, cellY,
+                landFormId, megatonCenter, loadTexture, texPath);
+
             return new TerrainTile
             {
                 Mesh = mesh,
+                LodMesh = lodMesh,
                 CollisionShape = collisionShape,
                 CellCoord = new Vector2(cellX, cellY),
             };
+        }
+
+        private ArrayMesh BuildLodTerrainMesh(float[,] heights, Color[,] vclrColors,
+            int cellX, int cellY, uint landFormId, Vector2 megatonCenter,
+            Func<string, Texture2D> loadTexture, string texPath)
+        {
+            const int lodStep = 4; // 33x33 -> 9x9 (every 4th vertex)
+            int lodGridSize = (GridSize - 1) / lodStep + 1; // 9
+
+            int lodQuadsPerSide = lodGridSize - 1;
+            int lodTotalVerts = lodGridSize * lodGridSize;
+            int lodTotalIndices = lodQuadsPerSide * lodQuadsPerSide * 6;
+
+            Vector3[] verts = new Vector3[lodTotalVerts];
+            Vector3[] norms = new Vector3[lodTotalVerts];
+            Color[] cols = new Color[lodTotalVerts];
+            Vector2[] uvs = new Vector2[lodTotalVerts];
+            int[] indices = new int[lodTotalIndices];
+
+            float hMin = float.MaxValue, hMax = float.MinValue;
+            for (int r = 0; r < GridSize; r++)
+                for (int c = 0; c < GridSize; c++)
+                {
+                    float h = heights[r, c];
+                    if (h < hMin) hMin = h;
+                    if (h > hMax) hMax = h;
+                }
+            float hRange = hMax - hMin;
+            float hCenter = (hMin + hMax) * 0.5f;
+
+            float originX = cellX * CellSize;
+            float originY = cellY * CellSize;
+            float step = CellSize / (GridSize - 1);
+
+            for (int r = 0; r < lodGridSize; r++)
+            {
+                for (int c = 0; c < lodGridSize; c++)
+                {
+                    int srcR = r * lodStep;
+                    int srcC = c * lodStep;
+                    int idx = r * lodGridSize + c;
+
+                    float godotX = (originX + srcC * step - megatonCenter.X) * WorldScale;
+                    float godotY = (hCenter + (heights[srcR, srcC] - hCenter) * HeightExaggeration) * HeightScale;
+                    float godotZ = -(originY + srcR * step - megatonCenter.Y) * WorldScale;
+
+                    verts[idx] = new Vector3(godotX, godotY, godotZ);
+
+                    if (vclrColors != null)
+                        cols[idx] = vclrColors[srcR, srcC];
+                    else
+                    {
+                        float t = hRange > 0.001f ? (heights[srcR, srcC] - hMin) / hRange : 0.5f;
+                        cols[idx] = new Color(1f - t, 0.2f, t);
+                    }
+
+                    const float textureTileUnits = 256f;
+                    float tileRepeats = CellSize / textureTileUnits;
+                    uvs[idx] = new Vector2(
+                        srcC / (float)(GridSize - 1) * tileRepeats,
+                        srcR / (float)(GridSize - 1) * tileRepeats);
+                }
+            }
+
+            int triIdx = 0;
+            for (int r = 0; r < lodQuadsPerSide; r++)
+            {
+                for (int c = 0; c < lodQuadsPerSide; c++)
+                {
+                    int bl = r * lodGridSize + c;
+                    int br = r * lodGridSize + c + 1;
+                    int tl = (r + 1) * lodGridSize + c;
+                    int tr = (r + 1) * lodGridSize + c + 1;
+
+                    indices[triIdx++] = bl;
+                    indices[triIdx++] = tl;
+                    indices[triIdx++] = br;
+                    indices[triIdx++] = br;
+                    indices[triIdx++] = tl;
+                    indices[triIdx++] = tr;
+                }
+            }
+
+            for (int r = 0; r < lodQuadsPerSide; r++)
+            {
+                for (int c = 0; c < lodQuadsPerSide; c++)
+                {
+                    int bl = r * lodGridSize + c;
+                    int br = r * lodGridSize + c + 1;
+                    int tl = (r + 1) * lodGridSize + c;
+                    int tr = (r + 1) * lodGridSize + c + 1;
+
+                    Vector3 v0 = verts[bl], v1 = verts[tl], v2 = verts[br], v3 = verts[tr];
+
+                    Vector3 n1 = (v1 - v0).Cross(v2 - v0);
+                    n1 = n1.Normalized();
+                    norms[bl] += n1;
+                    norms[tl] += n1;
+                    norms[br] += n1;
+
+                    Vector3 n2 = (v1 - v2).Cross(v3 - v2);
+                    n2 = n2.Normalized();
+                    norms[br] += n2;
+                    norms[tl] += n2;
+                    norms[tr] += n2;
+                }
+            }
+            for (int i = 0; i < lodTotalVerts; i++)
+            {
+                if (norms[i].LengthSquared() > 0.0001f)
+                    norms[i] = norms[i].Normalized();
+                else
+                    norms[i] = Vector3.Up;
+            }
+
+            var mesh = new ArrayMesh();
+            var arrays = new Godot.Collections.Array();
+            arrays.Resize((int)Mesh.ArrayType.Max);
+            arrays[(int)Mesh.ArrayType.Vertex] = verts;
+            arrays[(int)Mesh.ArrayType.Normal] = norms;
+            arrays[(int)Mesh.ArrayType.Color] = cols;
+            arrays[(int)Mesh.ArrayType.TexUV] = uvs;
+            arrays[(int)Mesh.ArrayType.Index] = indices;
+
+            mesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays);
+
+            var mat = new StandardMaterial3D();
+            mat.VertexColorUseAsAlbedo = true;
+            if (!string.IsNullOrEmpty(texPath) && loadTexture != null)
+            {
+                var tex = loadTexture(texPath);
+                if (tex != null)
+                    mat.AlbedoTexture = tex;
+            }
+            mesh.SurfaceSetMaterial(0, mat);
+
+            return mesh;
         }
 
         private TerrainTile BuildFlatTerrainTile(int cellX, int cellY, float defaultHeight, Vector2 megatonCenter)

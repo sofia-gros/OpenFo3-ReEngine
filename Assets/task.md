@@ -14,15 +14,15 @@ FO3 の BSShaderPPLightingProperty に相当するシェーダーシステム。
 
 - [x] 拡散テクスチャの抽出と適用
 - [x] ノーマルマップ（Environment Mask 赤チャンネルを Roughness に使用）
-- [-] スペキュラー/グロスマップ（Environment Mask で代用、カスタムシェーダー未実装）
-- [-] 環境/反射マップ（Slot 4→MetallicTexture、Slot 5→RoughnessTexture）
-- [-] ディテールマップ（Slot 6 DetailAlbedo 設定のみ、動作未確認）
+- [x] スペキュラー/グロスマップ（Environment Mask Green→Metallic, Red→Roughness のデュアルチャンネル対応）
+- [x] 環境/反射マップ（Slot 4→MetallicTexture, Slot 5→Roughness+Metallic 全シェーダータイプ対応）
+- [x] ディテールマップ（Slot 6 DetailAlbedo: DetailBlendMode=Mix, Uv1Scale=4x）
 - [x] パララックス/ハイトマップ（抽出・適用済み、ParallaxScale/ParallaxMaxPasses 対応）
 - [x] アルファテスト/ブレンドモードの完全対応（NiAlphaProperty + ShaderFlags ビット8）
 - [x] シェーダータイプの区別（全18タイプ中15タイプ実装、Wing/ SnowShader/ ZBufferWrite 追加）
 - [x] 頂点カラーの適用（NiGeometryData からの抽出と SurfaceTool.SetColor 対応）
 - [ ] スキニング/アニメーション（NiSkinInstance, NiSkinData, KF ファイル）
-- [ ] パーティクルシステム（FO3 パーティクルデータの解析と描画）
+- [x] パーティクルシステム（BSStripParticleSystem→GPUParticles3D 変換、NiParticleSystem パース）
 
 ## 2. ライティングシステム
 
@@ -45,10 +45,10 @@ LAND レコードからの地形メッシュ生成。
 - [x] ギャップフィリング（平坦地形での補完）
 - [x] 地形衝突形状の生成
 - [x] **メガトンの地面がない問題**（#10）— 内装ワールド用フォールバック平坦地形生成
-- [-] \_masterFormIDIndex での LAND フィルタ（コメントアウト中）
+- [x] \_masterFormIDIndex での LAND フィルタ（MasterFormIDIndex 共有により重複インデックス排除）
 - [x] テクスチャタイリング/ブレンド（BTXT の完全対応）
   - [x] UV タイル 256 単位リピート（CellSize/256 = 16）
-- [ ] 地形 LOD
+- [x] 地形 LOD（9x9 グリッド簡略化メッシュ生成、距離判定による自動切替）
 
 ## 4. 衝突/物理
 
@@ -57,10 +57,10 @@ NIF 内の bhk\* 物理ブロックからの衝突形状生成。
 - [x] bhkCollisionObject / bhkRigidBody の解析
 - [x] 各形状タイプの変換（Box, Sphere, Capsule, ConvexVertices, MoppBvTree, PackedNiTriStrips, List, NiTriStrips, Transform）
 - [x] Half-float デコンプレッション
-- [-] StaticBody3D + CollisionShape3D の構築
-- [ ] 動的物理（RigidBody, CharacterBody）
+- [x] StaticBody3D + CollisionShape3D の構築（MeshInstance3D の親として StaticBody3D を正しく配置）
+- [x] 動的物理（bhkRigidBody MotionType → RigidBody3D/CharacterBody3D/StaticBody3D 自動選択）
 - [ ] レイキャスト/ピッキング
-- [ ] Havok 由来の物理パラメータ（摩擦、反発）の対応
+- [x] Havok 由来の物理パラメータ（摩擦、反発）の対応（HavokMaterial→PhysicsMaterial 変換、21種類対応）
 
 ## 5. ちらつき/描画問題
 
@@ -110,9 +110,9 @@ NIF 内の bhk\* 物理ブロックからの衝突形状生成。
 
 ## 7. NAVMESH/経路探索
 
-- [ ] NAVM レコードの解析
-- [ ] ナビゲーションメッシュの生成
-- [ ] エージェント経路探索
+- [x] NAVM レコードの解析（NVVX/NVTR/NVDP サブレコードのパース）
+- [x] ナビゲーションメッシュの生成（NavigationMesh → NavigationRegion3D）
+- [ ] エージェント経路探索（NavigationAgent3D による NPC 経路探索）
 
 ## 8. サウンド/オーディオ
 
@@ -132,9 +132,10 @@ NIF 内の bhk\* 物理ブロックからの衝突形状生成。
 ## 10. キャラクター/アニメーション
 
 - [x] NiSkinInstance / NiSkinData の解析（バイナリレイアウト検証済み、SkinDataStore に保存）
-- [ ] スキンインスタンスのジオメトリへの関連付け（Node.SkinInstanceIndex）
-- [ ] スケルトン/アーマチュアの構築
-- [ ] 頂点ウェイトの適用（ボーン→メッシュバインド）
+- [x] スキンインスタンスのジオメトリへの関連付け（Node.SkinInstanceIndex → SkinDataStore）
+- [x] スケルトン/アーマチュアの構築（NiBone階層→Skeleton3D + ボーンRestTransform）
+- [x] 頂点ウェイトの抽出（BoneVertWeight → 頂点ごとの{boneId, weight}配列）
+- [ ] 頂点ウェイトのSurfaceTool適用（Redot API 非対応のため保留）
 - [ ] KF アニメーションファイルの読み込み
 - [ ] アニメーション再生システム
 - [ ] 第三人称カメラ
@@ -162,7 +163,7 @@ NIF 内の bhk\* 物理ブロックからの衝突形状生成。
 - [x] config.json による Fallout3Root パス設定（GamePaths.cs を改修）
 - [x] BSA ファイルリストの設定ファイル化（複数アーカイブ対応）
 - [x] ワールド設定の設定ファイル化（TargetWorld・CenterX/Y）
-- [ ] デバッグ表示/統計情報
+- [x] デバッグ表示/統計情報（FPS, カメラ位置, キャッシュ数, ワールド名, キュー状態）
 - [ ] パフォーマンス最適化
 - [ ] エラーハンドリングの強化
 
@@ -268,15 +269,22 @@ NIF 内の bhk\* 物理ブロックからの衝突形状生成。
    - [x] メガトンの地面がない問題（#10）
    - [x] ライトの向きが正しくない問題（#11）
    - [-] **街中の建築物の向きが合わない問題**（#12）— Redot 上での視覚検証待ち
-   - [x] ノーマルマップ/スペキュラーマップの対応（Environment Mask 代用）
+   - [x] ノーマルマップ/スペキュラーマップの対応（Environment Mask デュアルチャンネル）
    - [x] 頂点カラー対応
    - [x] シェーダータイプ区別（15/18 タイプ実装済み）
+   - [x] 環境/反射マップ対応（Slot 4→Metallic, Slot 5→Roughness+Metallic）
+   - [x] ディテールマップ対応（DetailBlendMode + UV 設定）
 
 2. **中優先度** - 拡張
    - [x] 全レコードタイプ対応（26タイプ）
    - [x] 複数ワールドスペース
    - [x] シャドウマップ
    - [x] NiSkinInstance/NiSkinData パース基盤
+   - [x] 地形 LOD（9x9 簡略メッシュ + 距離切替）
+   - [x] LAND インデックス最適化（共有インデックス使用）
+   - [x] StaticBody3D の親子関係修正（MeshInstance3D の親として StaticBody3D を正しく配置）
+   - [x] Havok 物理パラメータ対応（摩擦・反発のマテリアルマッピング）
+   - [x] デバッグ表示（FPS, カメラ位置, キャッシュ統計, キュー状態）
 
 3. **低優先度** - ゲームプレイ
    - NPC/AI
@@ -309,6 +317,59 @@ NIF 内の bhk\* 物理ブロックからの衝突形状生成。
 - カメラ位置はワールド切り替え時に維持（手動移動が必要）
 - 大規模ワールド（WastelandWorld）のロードは時間がかかる
 - 内装ワールドの Center 座標は MNAM がない場合 config.json のデフォルト値を使用
+
+### 2026-06-20: マテリアル改善 + 地形 LOD + LAND インデックス最適化
+
+1. **スペキュラー/グロスマップ改善**: Environment Mask (Slot 5) の Green チャンネルを Metallic に使用。Red→Roughness、Green→Metallic のデュアルチャンネルマッピングを実装。specular flag (bit 0) がオンの場合のみ適用。
+
+2. **環境/反射マップ対応拡充**: Environment Map (Slot 4) を全シェーダータイプで MetallicTexture として適用。従来は EnvironmentMap シェーダーのみ対応だったものを BuildDefault 含む全ビルダーに展開。
+
+3. **ディテールマップ修正**: DetailBlendMode を Mix に設定、Uv1Scale を 4x に設定してディテールテクスチャが正しく重なるよう修正。
+
+4. **LAND インデックス共有最適化**: TerrainBuilder が独自に LAND インデックスを構築するのをやめ、Megaton.cs の _masterFormIDIndex（既に LAND を含む）を SetLandIndex() で共有。メモリ重複排除。
+
+5. **地形 LOD 実装**: 33x33 グリッドから 4 スキップで 9x9 の簡略化メッシュを生成。_Process 内の UpdateTerrainLod() でカメラ距離 60 Godot 単位を閾値に自動切替。
+
+6. **リファクタリング**: ApplyDiffuse/ApplyNormalMap/ApplyEmission/ApplyEnvironmentMask/ApplyEnvironmentMap のヘルパー分割。コード重複削減と責務の明確化。
+
+### 2026-06-20: パフォーマンス最適化（プーリング＋フラスタムカリング＋LOD基盤）
+
+1. **インスタンスプーリング**: MeshInstance3D を NIFパス単位でプールし、`new MeshInstance3D()` の代わりに `RentMeshInstance()` で再利用
+2. **フラスタムカリング**: `UpdateFrustumCulling()` で `Camera3D.IsPositionInFrustum()` による視野外プロップの非表示化。カメラFar=300に設定
+3. **Prop LOD基盤**: `UpdatePropLod()` で距離に応じたメッシュ差し替え機構。`TrackProp()` ですべての生成プロップを追跡
+4. **ワールド切り替え時のプール解放**: `ReturnWorldPropsToPool()` で非アクティブワールドのプールリサイクル
+
+今後の拡張: LODメッシュ自動生成（マージ/デシメーション）、SpatialGridによる空間分割
+
+### 2026-06-20: 残り3シェーダータイプ実装（FO3 Sky / Water / Unlit）
+
+1. **BSVersion検出**: NIFReader に BsVersion フィールド追加、BSVer=34 以下を FO3 と判定
+2. **シェーダータイプ変換**: TranslateFO3ShaderType で FO3 BSShaderType (0,1,10,14,15,17,29,32,33) を内部正規型に変換
+   - FO3 TallGrass(0) → internal TallGrass(34)
+   - FO3 Sky(10) → internal FO3Sky(40)
+   - FO3 Water(17) → internal FO3Water(41)
+   - FO3 NoLighting(33) → internal FO3Unlit(42)
+3. **3新ハンドラ実装**: BuildFO3Sky（無光・発光）、BuildFO3Water（透明・屈折）、BuildFO3Unlit（無光・強制発光）
+4. **Skyrim互換維持**: BSVer>=35 の NIF は従来通り BSLightingShaderType ID をそのまま使用
+
+### 2026-06-20: パーティクルシステム + 動的物理 + スキニング基盤実装
+
+1. **パーティクルシステム**: BSStripParticleSystem の NiParticleSystem フィールドパース（WorldSpace, ModifierRefs）、TraverseExtract で検出し GPUParticles3D + ParticleProcessMaterial を生成
+2. **動的物理**: bhkRigidBody CInfo550_660 から MotionType を読み取り、StaticBody3D / RigidBody3D / CharacterBody3D を自動選択。質量・減衰パラメータ対応
+3. **スキニング基盤**: NiBone 階層から Skeleton3D 構築（ボーン名・RestTransform・親子関係）、BoneVertWeight の頂点ごとのボーンインデックス/ウェイト配列変換（最大4ボーン、正規化）
+4. **未対応**: SurfaceTool.SetBoneIndices/SetBoneWeights が Redot 26.1 に存在しないため、ウェイト適用は保留。スケルトンとメッシュの生成のみ完了
+
+### 2026-06-20: 衝突形状の親子関係修正 + Havok 物理パラメータ + デバッグ表示
+
+1. **StaticBody3D 親子関係修正**: MeshInstance3D を StaticBody3D の子として正しく配置するよう CreateAndAddInstance を改修。
+   - BuildCollision に skipAdd パラメータを追加し、呼び出し元で配置を制御
+   - 従来: Container → MeshInstance3D → StaticBody3D → CollisionShape3D
+   - 修正後: Container → StaticBody3D + CollisionShape3D → MeshInstance3D
+
+2. **Havok 物理パラメータ対応**: HavokMaterial → Godot PhysicsMaterial の変換マッピングを実装。
+   - 21 種類の Havok マテリアル（Stone, Cloth, Dirt, Glass, Grass, Metal, Organic, Skin, Water, Wood, Heavy Stone, Heavy Metal, Heavy Wood, Chain, Snow, Elevator, Hollow Metal, Sheet Metal, Sand, Broken Concrete, Iron）に対応
+   - Box/Sphere/Capsule/ConvexVertices/NiTriStrips/TransformShape からマテリアル抽出
+   - Friction（摩擦）と Bounce（反発）を Godot PhysicsMaterial に設定
 
 ## 最近の変更履歴
 

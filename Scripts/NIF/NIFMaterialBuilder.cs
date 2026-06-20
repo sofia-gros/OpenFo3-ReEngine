@@ -14,26 +14,29 @@ namespace OpenFo3.NIF
         private const int SlotSubsurface = 6;
         private const int SlotBackLighting = 7;
 
-        // FO3 BSShaderProperty shader types
-        private const int ShaderTypeDefault = 0;
-        private const int ShaderTypeDefaultAlt = 1;
-        private const int ShaderTypeEnvironmentMap = 2;
-        private const int ShaderTypeGlowShader = 3;
-        private const int ShaderTypeHeightmap = 4;
-        private const int ShaderTypeZBufferWrite = 5;
-        private const int ShaderTypeLODLandscape = 6;
-        private const int ShaderTypeLODBuilding = 7;
-        private const int ShaderTypeMultiLayerParallax = 10;
-        private const int ShaderTypeParallaxOcc = 11;
-        private const int ShaderTypeSnowShader = 14;
-        private const int ShaderTypeMultiLayerParallaxOcc = 15;
-        private const int ShaderTypeEnvironmentMapFO3 = 17;
-        private const int ShaderTypeWing = 29;
-        private const int ShaderTypeSkinTint = 31;
-        private const int ShaderTypeHairTint = 32;
-        private const int ShaderTypeParallaxOccInner = 33;
-        private const int ShaderTypeTallGrass = 34;
-        private const int ShaderTypeLODLandscapeNoGrass = 35;
+        const int ShaderTypeDefault = 0;
+        const int ShaderTypeDefaultAlt = 1;
+        const int ShaderTypeEnvironmentMap = 2;
+        const int ShaderTypeGlowShader = 3;
+        const int ShaderTypeHeightmap = 4;
+        const int ShaderTypeZBufferWrite = 5;
+        const int ShaderTypeLODLandscape = 6;
+        const int ShaderTypeLODBuilding = 7;
+        const int ShaderTypeMultiLayerParallax = 10;
+        const int ShaderTypeParallaxOcc = 11;
+        const int ShaderTypeSnowShader = 14;
+        const int ShaderTypeMultiLayerParallaxOcc = 15;
+        const int ShaderTypeEnvironmentMapFO3 = 17;
+        const int ShaderTypeWing = 29;
+        const int ShaderTypeSkinTint = 31;
+        const int ShaderTypeHairTint = 32;
+        const int ShaderTypeParallaxOccInner = 33;
+        const int ShaderTypeTallGrass = 34;
+        const int ShaderTypeLODLandscapeNoGrass = 35;
+
+        const int ShaderTypeFO3Sky = 40;
+        const int ShaderTypeFO3Water = 41;
+        const int ShaderTypeFO3Unlit = 42;
 
         public static StandardMaterial3D BuildMaterial(ShaderTextureInfo shader, AlphaPropertyInfo alpha,
             Func<string, Texture2D> loadTexture, Func<string, bool> textureHasAlpha = null)
@@ -90,6 +93,15 @@ namespace OpenFo3.NIF
                 case ShaderTypeHeightmap:
                     BuildHeightmap(mat, shader, texPaths, loadTexture);
                     break;
+                case ShaderTypeFO3Sky:
+                    BuildFO3Sky(mat, shader, texPaths, loadTexture);
+                    break;
+                case ShaderTypeFO3Water:
+                    BuildFO3Water(mat, shader, texPaths, loadTexture);
+                    break;
+                case ShaderTypeFO3Unlit:
+                    BuildFO3Unlit(mat, shader, texPaths, loadTexture);
+                    break;
                 default:
                     BuildDefault(mat, shader, texPaths, loadTexture);
                     break;
@@ -134,32 +146,95 @@ namespace OpenFo3.NIF
             }
         }
 
-        private static void ApplyCommonTextures(StandardMaterial3D mat, ShaderTextureInfo shader,
+        private static void ApplyDiffuse(StandardMaterial3D mat,
             string[] texPaths, Func<string, Texture2D> loadTexture)
         {
             if (texPaths == null) return;
-
             if (texPaths.Length > SlotDiffuse && !string.IsNullOrEmpty(texPaths[SlotDiffuse]))
             {
                 var tex = loadTexture(texPaths[SlotDiffuse]);
                 if (tex != null) mat.AlbedoTexture = tex;
             }
+        }
+
+        private static void ApplyNormalMap(StandardMaterial3D mat,
+            string[] texPaths, Func<string, Texture2D> loadTexture)
+        {
+            if (texPaths == null) return;
+            if (texPaths.Length > SlotNormalGloss && !string.IsNullOrEmpty(texPaths[SlotNormalGloss]))
+            {
+                var tex = loadTexture(texPaths[SlotNormalGloss]);
+                if (tex != null)
+                {
+                    mat.NormalTexture = tex;
+                    mat.NormalEnabled = true;
+                }
+            }
+        }
+
+        private static void ApplyEmission(StandardMaterial3D mat,
+            string[] texPaths, Func<string, Texture2D> loadTexture)
+        {
+            if (texPaths == null) return;
+            if (texPaths.Length > SlotGlowSkinHair && !string.IsNullOrEmpty(texPaths[SlotGlowSkinHair]))
+            {
+                var tex = loadTexture(texPaths[SlotGlowSkinHair]);
+                if (tex != null)
+                {
+                    mat.EmissionTexture = tex;
+                    mat.EmissionEnabled = true;
+                    mat.Emission = new Color(1f, 1f, 1f);
+                }
+            }
+        }
+
+        private static void ApplyEnvironmentMask(StandardMaterial3D mat, ShaderTextureInfo shader,
+            string[] texPaths, Func<string, Texture2D> loadTexture)
+        {
+            if (texPaths == null || texPaths.Length <= SlotEnvironmentMask) return;
+            if (string.IsNullOrEmpty(texPaths[SlotEnvironmentMask])) return;
+
+            var tex = loadTexture(texPaths[SlotEnvironmentMask]);
+            if (tex == null) return;
+
+            // Environment Mask (Slot 5) channel layout (FO3 convention):
+            //   Red   = Gloss / Smoothness (inverse of roughness)
+            //   Green = Specular intensity
+            //   Blue  = Environment map reflection amount
+            //
+            // StandardMaterial3D mapping:
+            //   RoughnessTexture (Red channel) — higher red = less rough (glossy)
+            //   MetallicTexture  (Green channel) — green channel approximates specular intensity
+            mat.RoughnessTexture = tex;
+            mat.RoughnessTextureChannel = BaseMaterial3D.TextureChannel.Red;
+            mat.MetallicTexture = tex;
+            mat.MetallicTextureChannel = BaseMaterial3D.TextureChannel.Green;
+        }
+
+        private static void ApplyEnvironmentMap(StandardMaterial3D mat,
+            string[] texPaths, Func<string, Texture2D> loadTexture)
+        {
+            if (texPaths == null || texPaths.Length <= SlotEnvironment) return;
+            if (string.IsNullOrEmpty(texPaths[SlotEnvironment])) return;
+
+            var tex = loadTexture(texPaths[SlotEnvironment]);
+            if (tex == null) return;
+
+            // Environment Map (Slot 4): Used as an additional metallic/reflectivity hint.
+            // When present, it overrides the base metallic value with its red channel.
+            mat.MetallicTexture = tex;
+            mat.MetallicTextureChannel = BaseMaterial3D.TextureChannel.Red;
+        }
+
+        private static void ApplyCommonTextures(StandardMaterial3D mat, ShaderTextureInfo shader,
+            string[] texPaths, Func<string, Texture2D> loadTexture)
+        {
+            if (texPaths == null) return;
+
+            ApplyDiffuse(mat, texPaths, loadTexture);
 
             mat.Roughness = 0.6f;
             mat.Metallic = 0.0f;
-
-            if ((shader.ShaderFlags & 0x00000001) != 0)
-            {
-                if (texPaths.Length > SlotEnvironmentMask && !string.IsNullOrEmpty(texPaths[SlotEnvironmentMask]))
-                {
-                    var tex = loadTexture(texPaths[SlotEnvironmentMask]);
-                    if (tex != null)
-                    {
-                        mat.RoughnessTexture = tex;
-                        mat.RoughnessTextureChannel = BaseMaterial3D.TextureChannel.Red;
-                    }
-                }
-            }
         }
 
         private static void BuildDefault(StandardMaterial3D mat, ShaderTextureInfo shader,
@@ -173,7 +248,6 @@ namespace OpenFo3.NIF
             else
                 mat.SpecularMode = BaseMaterial3D.SpecularModeEnum.Disabled;
 
-            // Rough metallic surfaces (e.g., rusted metal)
             if ((shader.ShaderFlags & (1 << 7)) != 0)
             {
                 mat.Metallic = 0.3f;
@@ -181,40 +255,11 @@ namespace OpenFo3.NIF
             }
 
             ApplyCommonTextures(mat, shader, texPaths, loadTexture);
+            ApplyNormalMap(mat, texPaths, loadTexture);
+            ApplyEmission(mat, texPaths, loadTexture);
 
-            // ---- Normal Map (Slot 1) ----
-            if (texPaths != null && texPaths.Length > SlotNormalGloss && !string.IsNullOrEmpty(texPaths[SlotNormalGloss]))
-            {
-                var tex = loadTexture(texPaths[SlotNormalGloss]);
-                if (tex != null)
-                {
-                    mat.NormalTexture = tex;
-                    mat.NormalEnabled = true;
-                }
-            }
-
-            // ---- Emissive / Glow (Slot 2) ----
-            if (texPaths != null && texPaths.Length > SlotGlowSkinHair && !string.IsNullOrEmpty(texPaths[SlotGlowSkinHair]))
-            {
-                var tex = loadTexture(texPaths[SlotGlowSkinHair]);
-                if (tex != null)
-                {
-                    mat.EmissionTexture = tex;
-                    mat.EmissionEnabled = true;
-                    mat.Emission = new Color(1f, 1f, 1f);
-                }
-            }
-
-            // ---- Roughness from Environment Mask (Slot 5) ----
-            if (texPaths != null && texPaths.Length > SlotEnvironmentMask && !string.IsNullOrEmpty(texPaths[SlotEnvironmentMask]))
-            {
-                var tex = loadTexture(texPaths[SlotEnvironmentMask]);
-                if (tex != null)
-                {
-                    mat.RoughnessTexture = tex;
-                    mat.RoughnessTextureChannel = BaseMaterial3D.TextureChannel.Red;
-                }
-            }
+            ApplyEnvironmentMask(mat, shader, texPaths, loadTexture);
+            ApplyEnvironmentMap(mat, texPaths, loadTexture);
         }
 
         private static void BuildGlowShader(StandardMaterial3D mat, ShaderTextureInfo shader,
@@ -239,17 +284,7 @@ namespace OpenFo3.NIF
                 }
             }
 
-            // Override emission with Glow map (Slot 2) if present
-            if (texPaths.Length > SlotGlowSkinHair && !string.IsNullOrEmpty(texPaths[SlotGlowSkinHair]))
-            {
-                var tex = loadTexture(texPaths[SlotGlowSkinHair]);
-                if (tex != null)
-                {
-                    mat.EmissionTexture = tex;
-                    mat.EmissionEnabled = true;
-                    mat.Emission = new Color(1f, 1f, 1f);
-                }
-            }
+            ApplyEmission(mat, texPaths, loadTexture);
         }
 
         private static void BuildEnvironmentMap(StandardMaterial3D mat, ShaderTextureInfo shader,
@@ -259,58 +294,11 @@ namespace OpenFo3.NIF
             mat.Metallic = 0.8f;
             mat.SpecularMode = BaseMaterial3D.SpecularModeEnum.SchlickGgx;
 
-            if (texPaths == null) return;
-
-            if (texPaths.Length > SlotDiffuse && !string.IsNullOrEmpty(texPaths[SlotDiffuse]))
-            {
-                var tex = loadTexture(texPaths[SlotDiffuse]);
-                if (tex != null) mat.AlbedoTexture = tex;
-            }
-
-            // ---- Normal Map (Slot 1) ----
-            if (texPaths.Length > SlotNormalGloss && !string.IsNullOrEmpty(texPaths[SlotNormalGloss]))
-            {
-                var tex = loadTexture(texPaths[SlotNormalGloss]);
-                if (tex != null)
-                {
-                    mat.NormalTexture = tex;
-                    mat.NormalEnabled = true;
-                }
-            }
-
-            // ---- Roughness from Environment Mask (Slot 5) ----
-            if (texPaths.Length > SlotEnvironmentMask && !string.IsNullOrEmpty(texPaths[SlotEnvironmentMask]))
-            {
-                var tex = loadTexture(texPaths[SlotEnvironmentMask]);
-                if (tex != null)
-                {
-                    mat.RoughnessTexture = tex;
-                    mat.RoughnessTextureChannel = BaseMaterial3D.TextureChannel.Red;
-                }
-            }
-
-            // ---- Environment Map (Slot 4) ----
-            if (texPaths.Length > SlotEnvironment && !string.IsNullOrEmpty(texPaths[SlotEnvironment]))
-            {
-                var tex = loadTexture(texPaths[SlotEnvironment]);
-                if (tex != null)
-                {
-                    mat.MetallicTexture = tex;
-                    mat.MetallicTextureChannel = BaseMaterial3D.TextureChannel.Red;
-                }
-            }
-
-            // ---- Emissive / Glow (Slot 2) ----
-            if (texPaths.Length > SlotGlowSkinHair && !string.IsNullOrEmpty(texPaths[SlotGlowSkinHair]))
-            {
-                var tex = loadTexture(texPaths[SlotGlowSkinHair]);
-                if (tex != null)
-                {
-                    mat.EmissionTexture = tex;
-                    mat.EmissionEnabled = true;
-                    mat.Emission = new Color(1f, 1f, 1f);
-                }
-            }
+            ApplyDiffuse(mat, texPaths, loadTexture);
+            ApplyNormalMap(mat, texPaths, loadTexture);
+            ApplyEnvironmentMask(mat, shader, texPaths, loadTexture);
+            ApplyEnvironmentMap(mat, texPaths, loadTexture);
+            ApplyEmission(mat, texPaths, loadTexture);
         }
 
         private static void BuildSkinTint(StandardMaterial3D mat, ShaderTextureInfo shader,
@@ -327,8 +315,9 @@ namespace OpenFo3.NIF
             mat.SubsurfScatterTransmittanceEnabled = true;
 
             ApplyCommonTextures(mat, shader, texPaths, loadTexture);
+            ApplyNormalMap(mat, texPaths, loadTexture);
+            ApplyEnvironmentMask(mat, shader, texPaths, loadTexture);
 
-            // Approximate transmittance color from Slot 2 (Glow/Skin) top-left pixel
             if (texPaths != null && texPaths.Length > SlotGlowSkinHair && !string.IsNullOrEmpty(texPaths[SlotGlowSkinHair]))
             {
                 var tex = loadTexture(texPaths[SlotGlowSkinHair]);
@@ -353,6 +342,8 @@ namespace OpenFo3.NIF
             mat.SpecularMode = BaseMaterial3D.SpecularModeEnum.Disabled;
 
             ApplyCommonTextures(mat, shader, texPaths, loadTexture);
+            ApplyNormalMap(mat, texPaths, loadTexture);
+            ApplyEnvironmentMask(mat, shader, texPaths, loadTexture);
         }
 
         private static void BuildTallGrass(StandardMaterial3D mat, ShaderTextureInfo shader,
@@ -371,16 +362,12 @@ namespace OpenFo3.NIF
             string[] texPaths, Func<string, Texture2D> loadTexture)
         {
             BuildDefault(mat, shader, texPaths, loadTexture);
-
-            // Heightmap and detail are applied after dispatch via ApplyHeightmap / ApplyDetail
         }
 
         private static void BuildHeightmap(StandardMaterial3D mat, ShaderTextureInfo shader,
             string[] texPaths, Func<string, Texture2D> loadTexture)
         {
             BuildDefault(mat, shader, texPaths, loadTexture);
-
-            // Heightmap is applied after dispatch via ApplyHeightmap
         }
 
         private static void BuildWing(StandardMaterial3D mat, ShaderTextureInfo shader,
@@ -393,31 +380,14 @@ namespace OpenFo3.NIF
             mat.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
 
             ApplyCommonTextures(mat, shader, texPaths, loadTexture);
-
-            if (texPaths == null) return;
-
-            if (texPaths.Length > SlotDiffuse && !string.IsNullOrEmpty(texPaths[SlotDiffuse]))
-            {
-                var tex = loadTexture(texPaths[SlotDiffuse]);
-                if (tex != null) mat.AlbedoTexture = tex;
-            }
-
-            if (texPaths.Length > SlotNormalGloss && !string.IsNullOrEmpty(texPaths[SlotNormalGloss]))
-            {
-                var tex = loadTexture(texPaths[SlotNormalGloss]);
-                if (tex != null)
-                {
-                    mat.NormalTexture = tex;
-                    mat.NormalEnabled = true;
-                }
-            }
+            ApplyDiffuse(mat, texPaths, loadTexture);
+            ApplyNormalMap(mat, texPaths, loadTexture);
+            ApplyEnvironmentMask(mat, shader, texPaths, loadTexture);
         }
 
         private static void BuildSnowShader(StandardMaterial3D mat, ShaderTextureInfo shader,
             string[] texPaths, Func<string, Texture2D> loadTexture)
         {
-            // Snow shader: bright, slightly metallic surface representing frost/snow accumulation.
-            // Uses default textures with a brighter albedo tint and higher roughness.
             mat.Roughness = 0.8f;
             mat.Metallic = 0.0f;
             mat.SpecularMode = BaseMaterial3D.SpecularModeEnum.Disabled;
@@ -436,22 +406,13 @@ namespace OpenFo3.NIF
                 }
             }
 
-            if (texPaths.Length > SlotNormalGloss && !string.IsNullOrEmpty(texPaths[SlotNormalGloss]))
-            {
-                var tex = loadTexture(texPaths[SlotNormalGloss]);
-                if (tex != null)
-                {
-                    mat.NormalTexture = tex;
-                    mat.NormalEnabled = true;
-                }
-            }
+            ApplyNormalMap(mat, texPaths, loadTexture);
+            ApplyEnvironmentMask(mat, shader, texPaths, loadTexture);
         }
 
         private static void BuildZBufferWrite(StandardMaterial3D mat, ShaderTextureInfo shader,
             string[] texPaths, Func<string, Texture2D> loadTexture)
         {
-            // ZBufferWrite shader: used for meshes that need special depth write behavior.
-            // For now, render as a standard opaque material with depth draw enabled.
             mat.Roughness = 0.6f;
             mat.Metallic = 0.0f;
 
@@ -461,24 +422,9 @@ namespace OpenFo3.NIF
                 mat.SpecularMode = BaseMaterial3D.SpecularModeEnum.Disabled;
 
             ApplyCommonTextures(mat, shader, texPaths, loadTexture);
-
-            if (texPaths == null) return;
-
-            if (texPaths.Length > SlotDiffuse && !string.IsNullOrEmpty(texPaths[SlotDiffuse]))
-            {
-                var tex = loadTexture(texPaths[SlotDiffuse]);
-                if (tex != null) mat.AlbedoTexture = tex;
-            }
-
-            if (texPaths.Length > SlotNormalGloss && !string.IsNullOrEmpty(texPaths[SlotNormalGloss]))
-            {
-                var tex = loadTexture(texPaths[SlotNormalGloss]);
-                if (tex != null)
-                {
-                    mat.NormalTexture = tex;
-                    mat.NormalEnabled = true;
-                }
-            }
+            ApplyDiffuse(mat, texPaths, loadTexture);
+            ApplyNormalMap(mat, texPaths, loadTexture);
+            ApplyEnvironmentMask(mat, shader, texPaths, loadTexture);
         }
 
         private static void ApplyHeightmap(StandardMaterial3D mat, ShaderTextureInfo shader,
@@ -507,6 +453,8 @@ namespace OpenFo3.NIF
 
             mat.DetailAlbedo = tex;
             mat.DetailEnabled = true;
+            mat.DetailBlendMode = BaseMaterial3D.BlendModeEnum.Mix;
+            mat.Uv1Scale = new Vector3(4f, 4f, 1f);
         }
 
         private static void ApplyRefraction(StandardMaterial3D mat, ShaderTextureInfo shader)
@@ -515,6 +463,65 @@ namespace OpenFo3.NIF
             {
                 mat.RefractionEnabled = true;
                 mat.RefractionScale = shader.RefractionStrength > 0 ? shader.RefractionStrength : 0.05f;
+            }
+        }
+
+        private static void BuildFO3Sky(StandardMaterial3D mat, ShaderTextureInfo shader,
+            string[] texPaths, Func<string, Texture2D> loadTexture)
+        {
+            mat.DisableAmbientLight = true;
+            mat.SpecularMode = BaseMaterial3D.SpecularModeEnum.Disabled;
+            mat.Roughness = 0.8f;
+            mat.Metallic = 0.0f;
+
+            ApplyDiffuse(mat, texPaths, loadTexture);
+
+            if (texPaths != null && texPaths.Length > SlotDiffuse && !string.IsNullOrEmpty(texPaths[SlotDiffuse]))
+            {
+                var tex = loadTexture(texPaths[SlotDiffuse]);
+                if (tex != null)
+                {
+                    mat.EmissionTexture = tex;
+                    mat.EmissionEnabled = true;
+                    mat.Emission = new Color(1f, 1f, 1f);
+                }
+            }
+        }
+
+        private static void BuildFO3Water(StandardMaterial3D mat, ShaderTextureInfo shader,
+            string[] texPaths, Func<string, Texture2D> loadTexture)
+        {
+            mat.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
+            mat.Roughness = 0.1f;
+            mat.Metallic = 0.0f;
+            mat.SpecularMode = BaseMaterial3D.SpecularModeEnum.SchlickGgx;
+            mat.RefractionEnabled = true;
+            mat.RefractionScale = shader.RefractionStrength > 0 ? shader.RefractionStrength : 0.1f;
+
+            ApplyDiffuse(mat, texPaths, loadTexture);
+            ApplyNormalMap(mat, texPaths, loadTexture);
+            ApplyEnvironmentMask(mat, shader, texPaths, loadTexture);
+            ApplyEnvironmentMap(mat, texPaths, loadTexture);
+        }
+
+        private static void BuildFO3Unlit(StandardMaterial3D mat, ShaderTextureInfo shader,
+            string[] texPaths, Func<string, Texture2D> loadTexture)
+        {
+            mat.DisableAmbientLight = true;
+            mat.SpecularMode = BaseMaterial3D.SpecularModeEnum.Disabled;
+            mat.Roughness = 1.0f;
+            mat.Metallic = 0.0f;
+
+            if (texPaths != null && texPaths.Length > SlotDiffuse && !string.IsNullOrEmpty(texPaths[SlotDiffuse]))
+            {
+                var tex = loadTexture(texPaths[SlotDiffuse]);
+                if (tex != null)
+                {
+                    mat.AlbedoTexture = tex;
+                    mat.EmissionTexture = tex;
+                    mat.EmissionEnabled = true;
+                    mat.Emission = new Color(1f, 1f, 1f);
+                }
             }
         }
     }
