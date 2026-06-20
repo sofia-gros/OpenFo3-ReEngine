@@ -1270,12 +1270,16 @@ public partial class Megaton : Node3D
 			var tex = ImageTexture.CreateFromImage(img);
 			_textureCache.TryAdd(searchPath, tex);
 
-			bool hasAlpha = img.GetFormat() == Image.Format.Rgba8;
-			if (!hasAlpha)
-			{
-				string fmtName = img.GetFormat().ToString();
-				hasAlpha = fmtName.IndexOf("A", StringComparison.OrdinalIgnoreCase) >= 0;
-			}
+			Image.Format fmt = img.GetFormat();
+				bool hasAlpha = fmt == Image.Format.Rgba8
+					|| fmt == Image.Format.Rgba4444
+					|| fmt == Image.Format.Dxt3
+					|| fmt == Image.Format.Dxt5
+					|| fmt == Image.Format.Dxt5RaAsRg
+					|| fmt == Image.Format.BptcRgba
+					|| fmt == Image.Format.Etc2Rgba8
+					|| fmt == Image.Format.Etc2Rgb8A1
+					|| fmt == Image.Format.Etc2RaAsRg;
 			_textureHasAlpha.TryAdd(searchPath, hasAlpha);
 
 			return tex;
