@@ -106,7 +106,7 @@ NIF 内の bhk\* 物理ブロックからの衝突形状生成。
   - [x] TACT（会話型アクティベータ）
   - [x] AMMO（弾薬）
 - [x] その他の BSA 読み込み（Misc, Voices 等、config.json の全 BSA を動的読み込み）
-- [ ] ワールドスペースの切り替え（Wasteland, DC ruins 等）
+- [x] ワールドスペースの切り替え（Wasteland, DC ruins 等）
 
 ## 7. NAVMESH/経路探索
 
@@ -274,7 +274,7 @@ NIF 内の bhk\* 物理ブロックからの衝突形状生成。
 
 2. **中優先度** - 拡張
    - [x] 全レコードタイプ対応（26タイプ）
-   - [ ] 複数ワールドスペース
+   - [x] 複数ワールドスペース
    - [x] シャドウマップ
    - [x] NiSkinInstance/NiSkinData パース基盤
 
@@ -286,6 +286,29 @@ NIF 内の bhk\* 物理ブロックからの衝突形状生成。
    - クエスト
 
 ---
+
+### 2026-06-20: 複数ワールドスペース対応 - 実装 (feat/multi-world)
+
+**問題:**
+1. Megaton.cs が単一ワールド（MegatonWorld）にハードコードされており、WastelandWorld や DC ruins 等の他のワールドスペースに切り替えられない。
+2. ワールドごとに異なる Center 座標、地形、ライティング、REFR 配置が必要。
+3. ワールド切り替えの UI 手段がない。
+
+**修正内容:**
+- `Megaton.cs` 全面改修:
+  - 全 WRLD レコードを `_Ready()` で自動検出（`DiscoverWorlds()`）
+  - WRLD の MNAM セル範囲から Center 座標を自動計算
+  - ワールドごとに `Node3D` コンテナを生成し、地形・ライティング・メッシュインスタンスを分離
+  - キーボード F1-F9 でワールド切り替え（`_Input()` オーバーライド）
+  - `LoadWorldAsync()` / `SwitchToWorld()` で遅延ロード + 表示切替
+  - ワールド名表示 Label3D を追加
+- 共有キャッシュ（メッシュ, NIF, テクスチャ）は全ワールドで再利用
+- REFR 非同期ロードは worldFormId でタグ付けし、正しいコンテナにルーティング
+
+**既知の制限:**
+- カメラ位置はワールド切り替え時に維持（手動移動が必要）
+- 大規模ワールド（WastelandWorld）のロードは時間がかかる
+- 内装ワールドの Center 座標は MNAM がない場合 config.json のデフォルト値を使用
 
 ## 最近の変更履歴
 
