@@ -7,7 +7,8 @@
     "Meshes": "Fallout - Meshes.bsa",
     "Textures": "Fallout - Textures.bsa",
     "Misc": "Fallout - Misc.bsa",
-    "Voices": "Fallout - Voices.bsa"
+    "Voices": "Fallout - Voices.bsa",
+    "Sound": "Fallout - Sound.bsa"
   },
 
   "World": {
@@ -21,5 +22,13 @@
     "ShadowAtlasSize": 4096,
     "DirectionalShadowSize": 4096,
     "SoftShadowQuality": 1
+  },
+
+  "StartPositions": {
+    "WastelandWorld": { "X": 2620, "Y": 2290 },
+    "Wasteland": { "X": 2620, "Y": 2290 },
+    "CapitalWasteland": { "X": 2620, "Y": 2290 },
+    "Vault101World": { "X": 0, "Y": 0 },
+    "Vault101": { "X": 0, "Y": 0 }
   }
 }

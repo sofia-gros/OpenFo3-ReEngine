@@ -381,3 +381,26 @@ NIF 内の bhk\* 物理ブロックからの衝突形状生成。
 - 修正後ビルド成功（0 エラー / 0 警告）
 - **残課題**: Redot 上でメガトン街中の建築物の回転が合っているか視覚検証する（外壁は完璧）
 - 補足: REFR 回転コード（`Megaton.cs` CreateAndAddInstance）は相似変換として数学的に正しいことを確認済み
+
+---
+
+### 2026-06-21: NIFマテリアル α改善 + ESM座標解決 + LAND BTXT検証 (feat/esm-terrain)
+
+1. **NIFMaterialBuilder α検出の拡張** (`940c1f4`):
+   - αチャンネル検出を Diffuse(0) に加えて Glow/Skin/Hair(2), Height/Parallax(3) スロットでも行うよう拡張
+   - `TextureHasAlphaForSlot()` ヘルパーで重複コードを統一
+   - 透過マテリアルに `CullMode.Disabled`（両面描画）を自動適用
+   - HairTint/BuildDefault の透明マテリアルにも `CullMode.Disabled` 追加
+
+2. **ESM LAND座標解決の改善** (`28331fe`):
+   - `BuildLandCoordinateMap()` が Cell Children GRUPs (groupType 6-10) を認識し、セル内部の LAND に正しい座標を割り当て
+   - GRUP ラベルを CellFormId として cellIndex 検索し、XCLC 座標を動的解決
+   - デバッグ出力の充実（セル数・LAND 数・座標不一致警告）
+
+3. **TerrainBuilder LAND BTXT 検証** (`28331fe`):
+   - BTXT（ベーステクスチャ）のない LAND レコードをスキップ（`btxtures.Length == 0` → `return null`）
+   - プレースホルダ/未使用 LAND による地形生成を防止
+   - 座標マッピングのクロスチェック機能追加（mapCoord vs 直接 XCLC パース比較）
+
+4. **ドキュメント追加** (`33e8844`):
+   - `Assets/project.md`: プロジェクト構造概要、回転/変換パイプラインの数理説明、全 C#/Python 変換コードの一覧と解説

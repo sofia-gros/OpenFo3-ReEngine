@@ -159,6 +159,7 @@ namespace OpenFo3.World
                 return null;
 
             var navMesh = new NavigationMesh();
+            navMesh.CellSize = 0.5f;
 
             int numVerts = navData.Vertices.Length;
             Vector3[] verts = new Vector3[numVerts];

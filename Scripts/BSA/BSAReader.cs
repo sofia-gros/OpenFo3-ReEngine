@@ -11,6 +11,7 @@ namespace OpenFo3.BSA
         private BinaryReader _reader;
         private Stream _stream;
         private readonly object _lock = new();
+        private List<BSAFile> _cachedFiles;
 
         public string FilePath { get; private set; }
 
@@ -64,75 +65,92 @@ namespace OpenFo3.BSA
 
         public List<BSAFile> ExtractFileList()
         {
+            if (_cachedFiles != null)
+                return _cachedFiles;
+
             var files = new List<BSAFile>();
 
-            // Folder Records
-            var folderRecords = new List<FolderRecord>();
-            for (int i = 0; i < BSAHeader.FolderCount; i++)
+            lock (_lock)
             {
-                folderRecords.Add(new FolderRecord
+                _stream.Position = 0;
+                ReadHeader();
+
+                // Folder Records
+                var folderRecords = new List<FolderRecord>();
+                for (int i = 0; i < BSAHeader.FolderCount; i++)
                 {
-                    Hash = _reader.ReadUInt64(),
-                    Count = _reader.ReadUInt32(),
-                    Offset = _reader.ReadUInt32()
-                });
-            }
-
-            // Folder details and File records
-            var allFileRecords = new List<List<FileRecord>>();
-            var folderNames = new List<string>();
-
-            foreach (var folder in folderRecords)
-            {
-                // Each folder starts with its name (length-prefixed)
-                byte nameLen = _reader.ReadByte();
-                byte[] nameBytes = _reader.ReadBytes(nameLen - 1); // length includes null terminator?
-                _reader.ReadByte(); // consume null terminator
-                string folderName = Encoding.ASCII.GetString(nameBytes).Replace('\\', '/');
-                folderNames.Add(folderName);
-
-                var fileRecords = new List<FileRecord>();
-                for (int i = 0; i < folder.Count; i++)
-                {
-                    fileRecords.Add(new FileRecord
+                    folderRecords.Add(new FolderRecord
                     {
                         Hash = _reader.ReadUInt64(),
-                        Size = _reader.ReadUInt32(),
+                        Count = _reader.ReadUInt32(),
                         Offset = _reader.ReadUInt32()
                     });
                 }
-                allFileRecords.Add(fileRecords);
-            }
 
-            // File Names block
-            var fileNames = new List<string>();
-            for (int i = 0; i < BSAHeader.FileCount; i++)
-            {
-                var sb = new StringBuilder();
-                char c;
-                while ((c = (char)_reader.ReadByte()) != '\0')
-                {
-                    sb.Append(c);
-                }
-                fileNames.Add(sb.ToString());
-            }
+                // Folder details and File records
+                var allFileRecords = new List<List<FileRecord>>();
+                var folderNames = new List<string>();
 
-            // Combine into BSAFile objects
-            int fileNameIdx = 0;
-            for (int i = 0; i < folderNames.Count; i++)
-            {
-                foreach (var record in allFileRecords[i])
+                foreach (var folder in folderRecords)
                 {
-                    files.Add(new BSAFile
+                    // Each folder starts with its name (length-prefixed)
+                    if (_stream.Position >= _stream.Length) break;
+                    byte nameLen = _reader.ReadByte();
+                    if (nameLen == 0) nameLen = 1;
+                    byte[] nameBytes = _reader.ReadBytes(nameLen - 1); // length includes null terminator?
+                    if (_stream.Position >= _stream.Length) break;
+                    _reader.ReadByte(); // consume null terminator
+                    string folderName = Encoding.ASCII.GetString(nameBytes).Replace('\\', '/');
+                    folderNames.Add(folderName);
+
+                    var fileRecords = new List<FileRecord>();
+                    for (int i = 0; i < folder.Count; i++)
                     {
-                        Path = folderNames[i] + "/" + fileNames[fileNameIdx++],
-                        Size = record.Size,
-                        Offset = record.Offset,
-                        Hash = record.Hash
-                    });
+                        if (_stream.Position + 16 > _stream.Length) break;
+                        fileRecords.Add(new FileRecord
+                        {
+                            Hash = _reader.ReadUInt64(),
+                            Size = _reader.ReadUInt32(),
+                            Offset = _reader.ReadUInt32()
+                        });
+                    }
+                    allFileRecords.Add(fileRecords);
+                }
+
+                // File Names block
+                var fileNames = new List<string>();
+                for (int i = 0; i < BSAHeader.FileCount; i++)
+                {
+                    if (_stream.Position >= _stream.Length) break;
+                    var sb = new StringBuilder();
+                    char c;
+                    while ((c = (char)_reader.ReadByte()) != '\0')
+                    {
+                        sb.Append(c);
+                        if (_stream.Position >= _stream.Length) break;
+                    }
+                    fileNames.Add(sb.ToString());
+                }
+
+                // Combine into BSAFile objects
+                int fileNameIdx = 0;
+                for (int i = 0; i < folderNames.Count && i < allFileRecords.Count; i++)
+                {
+                    foreach (var record in allFileRecords[i])
+                    {
+                        if (fileNameIdx >= fileNames.Count) break;
+                        files.Add(new BSAFile
+                        {
+                            Path = folderNames[i] + "/" + fileNames[fileNameIdx++],
+                            Size = record.Size,
+                            Offset = record.Offset,
+                            Hash = record.Hash
+                        });
+                    }
                 }
             }
 
+            _cachedFiles = files;
             return files;
         }
 
@@ -180,7 +198,9 @@ namespace OpenFo3.BSA
                         if (zOffset != -1)
                         {
                             _stream.Position = startOfBody + zOffset;
-                            byte[] compressedData = _reader.ReadBytes((int)rawSize - zOffset);
+                            int compressedLen = (int)rawSize - zOffset;
+                            if (compressedLen <= 0) return null;
+                            byte[] compressedData = _reader.ReadBytes(compressedLen);
                             
                             using (var ms = new MemoryStream(compressedData))
                             using (var resultMs = new MemoryStream())
@@ -194,6 +214,7 @@ namespace OpenFo3.BSA
                         {
                             // If not found, maybe it's raw deflate or something else
                              _stream.Position = startOfBody;
+                             if (rawSize <= 4) return null;
                              // Just try standard offset (jump 4 bytes for uncompressed size)
                              _stream.Seek(4, SeekOrigin.Current);
                              byte[] compressedData = _reader.ReadBytes((int)rawSize - 4);
@@ -230,6 +251,22 @@ namespace OpenFo3.BSA
             public ulong Hash;
             public uint Size;
             public uint Offset;
+        }
+
+        public bool FindFile(string path, out BSAFile result)
+        {
+            var files = ExtractFileList();
+            string normalized = path.Replace('\\', '/');
+            foreach (var f in files)
+            {
+                if (string.Equals(f.Path, normalized, StringComparison.OrdinalIgnoreCase))
+                {
+                    result = f;
+                    return true;
+                }
+            }
+            result = default;
+            return false;
         }
 
         public void Dispose()

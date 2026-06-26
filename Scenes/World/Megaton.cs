@@ -24,7 +24,7 @@ public partial class Megaton : Node3D
 	private Dictionary<string, Stack<Node3D>> _propPool = new();
 	private Dictionary<string, List<PropEntry>> _propEntries = new();
 	private Camera3D _cachedCamera;
-	private const float PropLodDistance = 80f;
+	private float PropLodDistance => PerformanceSettings.PropLodDistance;
 
 	private List<BSAReader> _bsaReaders = new();
 	private BSAReader _texturesBsa;
@@ -32,6 +32,8 @@ public partial class Megaton : Node3D
 
 	private Dictionary<uint, RecordEntry> _masterFormIDIndex;
 	private Dictionary<uint, RecordEntry> _refrFormIDIndex;
+	private Dictionary<uint, RecordEntry> _achrIndex;
+	private Dictionary<uint, RecordEntry> _acreIndex;
 
 	private List<(BSAReader BSA, List<BSAFile> Files)> _meshBsaList = new();
 	private List<(BSAReader BSA, List<BSAFile> Files)> _textureBsaList = new();
@@ -42,6 +44,11 @@ public partial class Megaton : Node3D
 	private LightingLoader _lightingLoader;
 	private TerrainBuilder _terrainBuilder;
 	private NavMeshBuilder _navMeshBuilder;
+	private AudioManager _audioManager;
+	private AnimationManager _animationManager;
+	private PickHandler _pickHandler;
+	private WorldSelectMenu _worldSelectMenu;
+	private bool _hudVisible = true;
 
 	private struct InstanceRequest
 	{
@@ -52,6 +59,8 @@ public partial class Megaton : Node3D
 		public string BaseType;
 		public float Scale;
 		public uint WorldFormId;
+		public uint BaseFormId;
+		public List<string> AnimPaths;
 	}
 
 	private struct WorldData
@@ -72,6 +81,7 @@ public partial class Megaton : Node3D
 	private string _currentWorldName;
 	private Label3D _worldLabel;
 	private bool _initialized = false;
+	private int _frameCount = 0;
 	private bool _debugShowCollision = false;
 	private bool _debugShowNavigation = false;
 	private bool _debugShowPaths = false;
@@ -86,7 +96,7 @@ public partial class Megaton : Node3D
 		public ArrayMesh LodMesh;
 	}
 	private Dictionary<string, List<TerrainLodEntry>> _terrainLodEntries = new();
-	private const float LodDistance = 60f;
+	private float LodDistance => PerformanceSettings.TerrainLodDistance;
 
 	private struct PropEntry
 	{
@@ -103,18 +113,55 @@ public partial class Megaton : Node3D
 	private const float CellSize = 4096f;
 	private const int MinTerrainHalf = 10;
 
+	// Auto world-switching (open world)
+	private int _autoSwitchCooldown = 0;
+	private const int AutoSwitchFrameInterval = 30; // Frames between checks
+	private const float WorldSwitchDistFo3 = 3000f;  // FO3 units (~45 Godot units)
+
 	public override void _Process(double delta)
 	{
 		if (!_initialized) return;
 
-		const int MaxPerFrame = 100;
-		for (int i = 0; i < MaxPerFrame && _instantiateQueue.TryDequeue(out var req); i++)
+		int maxPerFrame = PerformanceSettings.MaxInstancesPerFrame;
+		for (int i = 0; i < maxPerFrame && _instantiateQueue.TryDequeue(out var req); i++)
 		{
 			CreateAndAddInstance(req);
 		}
 
+		if (_hud != null && _currentWorldName != null)
+			_hud.SetWorldName($"World: {_currentWorldName}");
+
+		UpdateTerrainLod();
+		UpdateFrustumCulling();
+		UpdatePropLod();
 		UpdateDebugOverlay();
 		UpdateDebugVisualization();
+
+		_frameCount++;
+		if (_frameCount % 120 == 0)
+			EnforceCacheLimits();
+	}
+
+	private void EnforceCacheLimits()
+	{
+		if (_meshCache.Count > PerformanceSettings.MaxMeshCacheSize)
+		{
+			int excess = _meshCache.Count - PerformanceSettings.MaxMeshCacheSize;
+			var keys = _meshCache.Keys.Take(excess).ToList();
+			foreach (var k in keys) _meshCache.TryRemove(k, out _);
+		}
+		if (_textureCache.Count > PerformanceSettings.MaxTextureCacheSize)
+		{
+			int excess = _textureCache.Count - PerformanceSettings.MaxTextureCacheSize;
+			var keys = _textureCache.Keys.Take(excess).ToList();
+			foreach (var k in keys) _textureCache.TryRemove(k, out _);
+		}
+		if (_nifCache.Count > PerformanceSettings.MaxNifCacheSize)
+		{
+			int excess = _nifCache.Count - PerformanceSettings.MaxNifCacheSize;
+			var keys = _nifCache.Keys.Take(excess).ToList();
+			foreach (var k in keys) _nifCache.TryRemove(k, out _);
+		}
 	}
 
 	private void UpdateDebugOverlay()
@@ -223,18 +270,24 @@ public partial class Megaton : Node3D
 		}
 	}
 
-	public override void _Input(InputEvent @event)
-	{
-		if (!_initialized) return;
-		if (@event is InputEventKey key && key.Pressed && !key.Echo)
+		public override void _Input(InputEvent @event)
 		{
-			if (key.Keycode >= Key.Key1 && key.Keycode <= Key.Key9)
+			if (!_initialized) return;
+			if (@event is InputEventKey key && key.Pressed && !key.Echo)
 			{
-				int idx = (int)(key.Keycode - Key.Key1);
-				if (idx < _worldNameList.Count)
-				{
-					SwitchToWorld(_worldNameList[idx]);
-				}
+				// World select menu (P)
+				if (key.Keycode == Key.P && !key.CtrlPressed)
+			{
+				if (_worldSelectMenu != null)
+					_worldSelectMenu.Toggle();
+			}
+
+			// HUD toggle (F10)
+			if (key.Keycode == Key.F10)
+			{
+				_hudVisible = !_hudVisible;
+				if (_hud != null)
+					_hud.Visible = _hudVisible;
 			}
 
 			// Debug visualization toggles
@@ -257,6 +310,14 @@ public partial class Megaton : Node3D
 				UpdateDebugVisualizationNow();
 			}
 		}
+
+		if (@event is InputEventMouseButton mouse && mouse.Pressed && mouse.ButtonIndex == MouseButton.Left)
+		{
+			if (_pickHandler != null)
+			{
+				_pickHandler.PickObjectAtScreen(mouse.Position);
+			}
+		}
 	}
 
 	private Label _debugLabel;
@@ -264,6 +325,8 @@ public partial class Megaton : Node3D
 	public override async void _Ready()
 	{
 		await ToSignal(GetTree(), SceneTree.SignalName.ProcessFrame);
+
+		PerformanceSettings.Initialize();
 
 		try
 		{
@@ -275,15 +338,24 @@ public partial class Megaton : Node3D
 				"STAT", "DOOR", "FURN", "ACTI", "MSTT", "LIGH", "TERM",
 				"CONT", "MISC", "WEAP", "ARMO", "CLOT", "TREE", "ALCH",
 				"INGR", "BOOK", "GRAS", "LAND", "DEBR", "SCOL",
-				"KEYM", "ARMA", "NOTE", "PWAT", "TACT", "AMMO"
+				"KEYM", "ARMA", "NOTE", "PWAT", "TACT", "AMMO",
+				"NPC_", "CREA", "SOUN"
 			});
 
 			_refrFormIDIndex = _esm.BuildFormIdIndex(new[] { "REFR" });
+			_achrIndex = _esm.BuildFormIdIndex(new[] { "ACHR" });
+			_acreIndex = _esm.BuildFormIdIndex(new[] { "ACRE" });
 
 			_lightingLoader = new LightingLoader(_esm);
 			_terrainBuilder = new TerrainBuilder(_esm);
 			_terrainBuilder.SetLandIndex(_masterFormIDIndex);
 			_navMeshBuilder = new NavMeshBuilder(_esm);
+			_audioManager = new AudioManager(_esm, _bsaReaders);
+			_animationManager = new AnimationManager(_meshBsaList);
+			_pickHandler = new PickHandler();
+			_pickHandler.Name = "PickHandler";
+			_pickHandler.ObjectPicked += OnObjectPicked;
+			AddChild(_pickHandler);
 
 			CreateDebugOverlay();
 			DiscoverWorlds();
@@ -291,15 +363,23 @@ public partial class Megaton : Node3D
 			string targetWorld = GamePaths.GetTargetWorld();
 			if (!_worldDataByName.ContainsKey(targetWorld))
 			{
-				GD.PrintErr($"[Megaton] Target world '{targetWorld}' not found! Falling back to first available world.");
-				targetWorld = _worldNameList.Count > 0 ? _worldNameList[0] : null;
+				GD.PrintErr($"[Megaton] Target world '{targetWorld}' not found! Auto-selecting best world...");
+				targetWorld = _worldNameList.FirstOrDefault(n =>
+					n.Contains("Wasteland", StringComparison.OrdinalIgnoreCase) ||
+					n.Contains("Vault101", StringComparison.OrdinalIgnoreCase) ||
+					n.Contains("WasteLand", StringComparison.OrdinalIgnoreCase));
+				targetWorld ??= _worldNameList.Count > 0 ? _worldNameList[0] : null;
 			}
+			GD.Print($"[Megaton] Selected target world: {targetWorld}");
+
+			CreateWorldLabel();
 
 			if (targetWorld != null)
-			{
-				CreateWorldLabel();
 				_ = LoadWorldAsync(targetWorld);
-			}
+
+			CreateHud();
+			CreateWorldSelectMenu();
+			PopulateWorldSelectMenu();
 
 			_initialized = true;
 		}
@@ -307,6 +387,34 @@ public partial class Megaton : Node3D
 		{
 			GD.PrintErr($"[Megaton] Init error: {e.Message}");
 		}
+	}
+
+	private HudOverlay _hud;
+
+	private void CreateHud()
+	{
+		if (_hud != null) return;
+		_hud = new HudOverlay();
+		_hud.Name = "HUD";
+		AddChild(_hud);
+		_hud.SetLocation("Megaton");
+	}
+
+	private void CreateWorldSelectMenu()
+	{
+		if (_worldSelectMenu != null) return;
+		_worldSelectMenu = new WorldSelectMenu();
+		_worldSelectMenu.Name = "WorldSelectMenu";
+		AddChild(_worldSelectMenu);
+	}
+
+	private void PopulateWorldSelectMenu()
+	{
+		if (_worldSelectMenu == null) return;
+		_worldSelectMenu.LoadWorlds(_worldNameList, (worldName) =>
+		{
+			SwitchToWorld(worldName);
+		});
 	}
 
 	private void CreateDebugOverlay()
@@ -464,14 +572,21 @@ public partial class Megaton : Node3D
 			}
 		}
 
+		// Log all discovered worlds for debugging
+		GD.Print($"[Megaton] === DISCOVERED WORLDS ({_worldNameList.Count}) ===");
+		for (int i = 0; i < _worldNameList.Count; i++)
+			GD.Print($"  [{i + 1}] {_worldNameList[i]}");
+		GD.Print("[Megaton] =================================");
+
 		// Sort world list: put common worlds first for easy keyboard access
 		_worldNameList = _worldNameList
 			.OrderByDescending(n =>
 			{
-				if (n.Contains("Megaton")) return 100;
-				if (n.Contains("Wasteland") || n.Contains("WasteLand")) return 90;
+				if (n.Contains("Wasteland") || n.Contains("WasteLand") || n.Contains("WastelandWorld")) return 100;
+				if (n.Contains("Megaton")) return 90;
 				if (n.Contains("DC") || n.Contains("DCTallGrass")) return 80;
-				if (n.Contains("Interior")) return 70;
+				if (n.Contains("Vault") || n.Contains("Vault101")) return 70;
+				if (n.Contains("Interior")) return 60;
 				return 0;
 			})
 			.ThenBy(n => n)
@@ -489,6 +604,15 @@ public partial class Megaton : Node3D
 			return;
 		}
 
+		await LoadWorldInnerAsync(worldName, visible: true);
+		ShowWorld(worldName);
+	}
+
+	private async Task LoadWorldInnerAsync(string worldName, bool visible)
+	{
+		if (_worldLoading.ContainsKey(worldName) && _worldLoading[worldName]) return;
+		if (_worldContainers.ContainsKey(worldName)) return;
+
 		if (!_worldDataByName.TryGetValue(worldName, out var wd))
 		{
 			GD.PrintErr($"[Megaton] Unknown world: {worldName}");
@@ -500,6 +624,7 @@ public partial class Megaton : Node3D
 
 		var container = new Node3D();
 		container.Name = $"World_{worldName}";
+		container.Visible = visible;
 		AddChild(container);
 
 		_worldContainers[worldName] = container;
@@ -516,8 +641,8 @@ public partial class Megaton : Node3D
 		// Load REFRs on background thread
 		await Task.Run(() => LoadWorldRefrs(wd));
 
-		ShowWorld(worldName);
 		_worldLoading[worldName] = false;
+		GD.Print($"[Megaton] Finished loading world: {worldName}");
 	}
 
 	private void LoadTerrain(WorldData wd, Node3D container)
@@ -641,7 +766,25 @@ public partial class Megaton : Node3D
 				refrsToProcess.Add(kvp.Value.Offset);
 		}
 
-		GD.Print($"[Megaton] World '{wd.Name}': {refrsToProcess.Count} REFRs found.");
+		int achrCount = 0, acreCount = 0;
+		foreach (var kvp in _achrIndex)
+		{
+			if (kvp.Value.WorldFormId == wd.FormId)
+			{
+				refrsToProcess.Add(kvp.Value.Offset);
+				achrCount++;
+			}
+		}
+		foreach (var kvp in _acreIndex)
+		{
+			if (kvp.Value.WorldFormId == wd.FormId)
+			{
+				refrsToProcess.Add(kvp.Value.Offset);
+				acreCount++;
+			}
+		}
+
+		GD.Print($"[Megaton] World '{wd.Name}': {refrsToProcess.Count} placements (REFR + {achrCount} ACHR + {acreCount} ACRE).");
 
 		Parallel.ForEach(refrsToProcess, offset =>
 		{
@@ -651,7 +794,7 @@ public partial class Megaton : Node3D
 		GD.Print($"[Megaton] World '{wd.Name}': parsing done. Queue: {_instantiateQueue.Count}");
 	}
 
-	private void ProcessRecord(long offset, WorldData wd)
+		private void ProcessRecord(long offset, WorldData wd)
 	{
 		try
 		{
@@ -664,6 +807,7 @@ public partial class Megaton : Node3D
 				subs = _esm.GetSubRecords(record);
 			}
 
+			string recType = record.Type;
 			var dataSub = subs.FirstOrDefault(s => s.Type == "DATA");
 			var nameSub = subs.FirstOrDefault(s => s.Type == "NAME");
 			if (dataSub == null || nameSub == null) return;
@@ -688,7 +832,7 @@ public partial class Megaton : Node3D
 				}
 			}
 
-			if (nifPath == null && baseType != "LIGH") return;
+			if (nifPath == null && baseType != "LIGH" && baseType != "SOUN") return;
 
 			if (nifPath != null)
 			{
@@ -723,6 +867,34 @@ public partial class Megaton : Node3D
 				scale = BitConverter.ToSingle(xclSub.Data, 0);
 			}
 
+			List<string> animPaths = null;
+			if (baseType == "CREA" || baseType == "NPC_")
+			{
+				lock (_esm)
+				{
+					var kffz = baseSubs.FirstOrDefault(s => s.Type == "KFFZ");
+					if (kffz != null && kffz.Data.Length > 0)
+					{
+						animPaths = new List<string>();
+						int pos = 0;
+						while (pos < kffz.Data.Length)
+						{
+							int end = Array.IndexOf(kffz.Data, (byte)0, pos);
+							if (end < 0) end = kffz.Data.Length;
+							string animPath = Encoding.ASCII.GetString(kffz.Data, pos, end - pos);
+							if (!string.IsNullOrEmpty(animPath))
+							{
+								string p = animPath.Replace('\\', '/');
+								if (!p.StartsWith("meshes/"))
+									p = "meshes/" + p;
+								animPaths.Add(p);
+							}
+							pos = end + 1;
+						}
+					}
+				}
+			}
+
 			_instantiateQueue.Enqueue(new InstanceRequest
 			{
 				Path = nifPath,
@@ -735,6 +907,8 @@ public partial class Megaton : Node3D
 				BaseType = baseType,
 				Scale = scale,
 				WorldFormId = wd.FormId,
+				BaseFormId = formId,
+				AnimPaths = animPaths,
 			});
 
 			if (baseType == "SCOL")
@@ -803,9 +977,9 @@ public partial class Megaton : Node3D
 					float lrz = BitConverter.ToSingle(dataSub.Data, off + 20);
 					float scale = BitConverter.ToSingle(dataSub.Data, off + 24);
 
-					float sRz = (float)Math.Sin(Mathf.DegToRad(scolRz)), cRz = (float)Math.Cos(Mathf.DegToRad(scolRz));
-					float sRy = (float)Math.Sin(Mathf.DegToRad(scolRy)), cRy = (float)Math.Cos(Mathf.DegToRad(scolRy));
-					float sRx = (float)Math.Sin(Mathf.DegToRad(scolRx)), cRx = (float)Math.Cos(Mathf.DegToRad(scolRx));
+					float sRz = (float)Math.Sin(scolRz), cRz = (float)Math.Cos(scolRz);
+					float sRy = (float)Math.Sin(scolRy), cRy = (float)Math.Cos(scolRy);
+					float sRx = (float)Math.Sin(scolRx), cRx = (float)Math.Cos(scolRx);
 					float s00 = cRz * cRy;
 					float s01 = cRz * sRy * sRx - sRz * cRx;
 					float s02 = cRz * sRy * cRx + sRz * sRx;
@@ -816,9 +990,9 @@ public partial class Megaton : Node3D
 					float s21 = cRy * sRx;
 					float s22 = cRy * cRx;
 
-					float lRz = (float)Math.Sin(Mathf.DegToRad(lrz)), lCz = (float)Math.Cos(Mathf.DegToRad(lrz));
-					float lRy = (float)Math.Sin(Mathf.DegToRad(lry)), lCy = (float)Math.Cos(Mathf.DegToRad(lry));
-					float lRx = (float)Math.Sin(Mathf.DegToRad(lrx)), lCx = (float)Math.Cos(Mathf.DegToRad(lrx));
+					float lRz = (float)Math.Sin(lrz), lCz = (float)Math.Cos(lrz);
+					float lRy = (float)Math.Sin(lry), lCy = (float)Math.Cos(lry);
+					float lRx = (float)Math.Sin(lrx), lCx = (float)Math.Cos(lrx);
 					float l00 = lCz * lCy;
 					float l01 = lCz * lRy * lRx - lRz * lCx;
 					float l02 = lCz * lRy * lCx + lRz * lRx;
@@ -843,9 +1017,9 @@ public partial class Megaton : Node3D
 					float wy = scolPy + s10 * lx + s11 * ly + s12 * lz;
 					float wz = scolPz + s20 * lx + s21 * ly + s22 * lz;
 
-					float combinedRx = Mathf.RadToDeg((float)Math.Atan2(r21, r22));
-					float combinedRy = Mathf.RadToDeg((float)Math.Asin(Math.Clamp(-r20, -1f, 1f)));
-					float combinedRz = Mathf.RadToDeg((float)Math.Atan2(r10, r00));
+					float combinedRx = (float)Math.Atan2(r21, r22);
+					float combinedRy = (float)Math.Asin(Math.Clamp(-r20, -1f, 1f));
+					float combinedRz = (float)Math.Atan2(r10, r00);
 
 					_instantiateQueue.Enqueue(new InstanceRequest
 					{
@@ -890,7 +1064,7 @@ public partial class Megaton : Node3D
 		}
 	}
 
-	private void ShowWorld(string worldName)
+	private void ShowWorld(string worldName, bool repositionCamera = true)
 	{
 		if (_currentWorldName != null && _worldContainers.TryGetValue(_currentWorldName, out var oldContainer))
 		{
@@ -898,6 +1072,9 @@ public partial class Megaton : Node3D
 		}
 
 		_currentWorldName = worldName;
+
+		if (_hud != null)
+			_hud.SetWorldName($"World: {worldName}");
 
 		if (_worldContainers.TryGetValue(worldName, out var container))
 		{
@@ -912,7 +1089,7 @@ public partial class Megaton : Node3D
 
 		_cachedCamera = null;
 
-		if (_worldDataByName.TryGetValue(worldName, out var cameraWd))
+		if (repositionCamera && _worldDataByName.TryGetValue(worldName, out var cameraWd))
 		{
 			RepositionCameraForWorld(cameraWd);
 		}
@@ -925,14 +1102,23 @@ public partial class Megaton : Node3D
 		var cam = GetViewport()?.GetCamera3D();
 		if (cam == null) return;
 
-		float fo3X = (wd.NwCellX + wd.SeCellX) * CellSize / 2f;
-		float fo3Y = (wd.NwCellY + wd.SeCellY) * CellSize / 2f;
+		float fo3X, fo3Y;
+
+		// Check for configured start position
+		if (TryReadStartPosition(wd.Name, out float startFo3X, out float startFo3Y))
+		{
+			fo3X = startFo3X;
+			fo3Y = startFo3Y;
+		}
+		else
+		{
+			fo3X = (wd.NwCellX + wd.SeCellX) * CellSize / 2f;
+			fo3Y = (wd.NwCellY + wd.SeCellY) * CellSize / 2f;
+		}
 
 		float godotX = (fo3X - wd.Center.X) * WorldScale;
 		float godotZ = -(fo3Y - wd.Center.Y) * WorldScale;
 
-		// Place camera at terrain height: defaultLandHeight accounts for base elevation,
-		// add 20 Godot units (~1333 FO3 units) to account for typical VHGT offset
 		float godotY = wd.DefaultLandHeight * WorldScale + 20f;
 
 		cam.GlobalPosition = new Vector3(godotX, godotY, godotZ);
@@ -940,17 +1126,139 @@ public partial class Megaton : Node3D
 		GD.Print($"[Megaton] Camera -> ({godotX:F1}, {godotY:F1}, {godotZ:F1}) for '{wd.Name}'");
 	}
 
+	private bool TryReadStartPosition(string worldName, out float fo3X, out float fo3Y)
+	{
+		fo3X = 0; fo3Y = 0;
+		try
+		{
+			string configPath = ProjectSettings.GlobalizePath("res://config.json");
+			if (!System.IO.File.Exists(configPath)) return false;
+
+			string json = System.IO.File.ReadAllText(configPath);
+			using var doc = System.Text.Json.JsonDocument.Parse(json);
+			var root = doc.RootElement;
+			if (!root.TryGetProperty("StartPositions", out var starts)) return false;
+			if (!starts.TryGetProperty(worldName, out var pos)) return false;
+			if (pos.TryGetProperty("X", out var x) && pos.TryGetProperty("Y", out var y))
+			{
+				fo3X = (float)x.GetDouble();
+				fo3Y = (float)y.GetDouble();
+				return true;
+			}
+		}
+		catch { }
+		return false;
+	}
+
+	private void UpdateAutoWorldSwitch()
+	{
+		if (_currentWorldName == null) return;
+
+		// Check periodically
+		if (_autoSwitchCooldown > 0) { _autoSwitchCooldown--; return; }
+
+		var cam = GetViewport()?.GetCamera3D();
+		if (cam == null) return;
+		Vector3 camPos = cam.GlobalPosition;
+
+		if (!_worldDataByName.TryGetValue(_currentWorldName, out var currentWd)) return;
+
+		// Convert camera Godot position to absolute FO3 coordinates
+		float camFo3X = camPos.X / WorldScale + currentWd.Center.X;
+		float camFo3Y = -camPos.Z / WorldScale + currentWd.Center.Y;
+		float camFo3Z = camPos.Y / WorldScale;
+
+		// Find nearest exterior world (including current, with slight bias to prevent oscillation)
+		string nearestWorld = _currentWorldName;
+		float nearestDist = float.MaxValue;
+
+		foreach (var kvp in _worldDataByName)
+		{
+			var wd = kvp.Value;
+			if (!wd.HasMnam) continue;
+
+			float dx = camFo3X - wd.Center.X;
+			float dy = camFo3Y - wd.Center.Y;
+			float dist = Mathf.Sqrt(dx * dx + dy * dy);
+
+			// Tiny bias towards current world to prevent oscillation at equal distances
+			if (kvp.Key == _currentWorldName)
+				dist *= 0.99f;
+
+			if (dist < nearestDist)
+			{
+				nearestDist = dist;
+				nearestWorld = kvp.Key;
+			}
+		}
+
+		// Pre-load nearby worlds (within 2x switch threshold) in the background
+		float preloadThreshold = WorldSwitchDistFo3 * 2;
+		foreach (var kvp in _worldDataByName)
+		{
+			if (!kvp.Value.HasMnam) continue;
+			if (_worldContainers.ContainsKey(kvp.Key)) continue;
+			if (_worldLoading.ContainsKey(kvp.Key) && _worldLoading[kvp.Key]) continue;
+
+			float dx = camFo3X - kvp.Value.Center.X;
+			float dy = camFo3Y - kvp.Value.Center.Y;
+			float dist = Mathf.Sqrt(dx * dx + dy * dy);
+
+			if (dist < preloadThreshold)
+			{
+				_ = LoadWorldInnerAsync(kvp.Key, visible: false);
+			}
+		}
+
+		// Auto-switch if a different world is closer than threshold
+		if (nearestWorld != _currentWorldName && nearestDist < WorldSwitchDistFo3)
+		{
+			AutoSwitchToWorld(nearestWorld, camFo3X, camFo3Y, camFo3Z);
+		}
+	}
+
+	private void AutoSwitchToWorld(string worldName, float fo3X, float fo3Y, float fo3Z)
+	{
+		if (!_worldDataByName.TryGetValue(worldName, out var wd)) return;
+
+		// If not loaded yet, switch asynchronously after loading
+		if (!_worldContainers.ContainsKey(worldName))
+		{
+			_ = LoadWorldAndSwitchAutoAsync(worldName, fo3X, fo3Y, fo3Z);
+			return;
+		}
+
+		// Convert FO3 coords to Godot coords in the target world
+		float godotX = (fo3X - wd.Center.X) * WorldScale;
+		float godotZ = -(fo3Y - wd.Center.Y) * WorldScale;
+		float godotY = fo3Z * WorldScale;
+
+		ShowWorld(worldName, repositionCamera: false);
+
+		var cam = GetViewport()?.GetCamera3D();
+		if (cam != null)
+		{
+			cam.GlobalPosition = new Vector3(godotX, godotY, godotZ);
+		}
+
+		// Cooldown to prevent rapid back-and-forth switching
+		_autoSwitchCooldown = 60;
+		GD.Print($"[Megaton] Auto-switched to world: {worldName} at ({godotX:F1}, {godotY:F1}, {godotZ:F1})");
+	}
+
+	private async Task LoadWorldAndSwitchAutoAsync(string worldName, float fo3X, float fo3Y, float fo3Z)
+	{
+		await LoadWorldInnerAsync(worldName, visible: false);
+		AutoSwitchToWorld(worldName, fo3X, fo3Y, fo3Z);
+	}
+
 	private void CreateAndAddInstance(InstanceRequest req)
 	{
 		Node3D container;
 		if (req.WorldFormId != 0 && _worldNameById.TryGetValue(req.WorldFormId, out var wName))
-		{
 			container = _worldContainers.TryGetValue(wName, out var c) ? c : this;
-		}
 		else
-		{
 			container = this;
-		}
 
 		MeshInstance3D inst = null;
 		Node3D physicsBody = null;
@@ -963,9 +1271,9 @@ public partial class Megaton : Node3D
 			if (_skinnedCache.TryGetValue(req.Path, out var skinnedNodes) && skinnedNodes.Count > 0)
 			{
 				var basis = Basis.Identity;
-				basis = basis.Rotated(Vector3.Up,      -req.Rotation.Z);
-				basis = basis.Rotated(Vector3.Forward,  req.Rotation.Y);
-				basis = basis.Rotated(Vector3.Right,    req.Rotation.X);
+				basis = basis.Rotated(Vector3.Right,   req.Rotation.X);
+				basis = basis.Rotated(Vector3.Forward, req.Rotation.Y);
+				basis = basis.Rotated(Vector3.Up,      req.Rotation.Z);
 				basis = basis.Scaled(Vector3.One * req.Scale);
 				var transform = new Transform3D(basis, req.Position);
 
@@ -984,9 +1292,9 @@ public partial class Megaton : Node3D
 				if (mesh == null && req.BaseType != "LIGH") return;
 
 				var basis = Basis.Identity;
-				basis = basis.Rotated(Vector3.Up,      -req.Rotation.Z);
-				basis = basis.Rotated(Vector3.Forward,  req.Rotation.Y);
-				basis = basis.Rotated(Vector3.Right,    req.Rotation.X);
+				basis = basis.Rotated(Vector3.Right,   req.Rotation.X);
+				basis = basis.Rotated(Vector3.Forward, req.Rotation.Y);
+				basis = basis.Rotated(Vector3.Up,      req.Rotation.Z);
 				basis = basis.Scaled(Vector3.One * req.Scale);
 				var transform = new Transform3D(basis, req.Position);
 
@@ -1020,9 +1328,9 @@ public partial class Megaton : Node3D
 		if (!string.IsNullOrEmpty(req.Path) && _particleCache.TryGetValue(req.Path, out var particles))
 		{
 			var basis = Basis.Identity;
-			basis = basis.Rotated(Vector3.Up,      -req.Rotation.Z);
-			basis = basis.Rotated(Vector3.Forward,  req.Rotation.Y);
-			basis = basis.Rotated(Vector3.Right,    req.Rotation.X);
+			basis = basis.Rotated(Vector3.Right,   req.Rotation.X);
+			basis = basis.Rotated(Vector3.Forward, req.Rotation.Y);
+			basis = basis.Rotated(Vector3.Up,      req.Rotation.Z);
 			basis = basis.Scaled(Vector3.One * req.Scale);
 			var worldTransform = new Transform3D(basis, req.Position);
 
@@ -1077,6 +1385,79 @@ public partial class Megaton : Node3D
 			if (lightNode != null)
 			{
 				container.AddChild(lightNode);
+			}
+		}
+
+		if (req.BaseType == "SOUN")
+		{
+			var soundData = _audioManager.ParseSoundRecord(req.FormId);
+			if (soundData != null)
+			{
+				var player = AudioManager.CreateSoundPlayer(soundData, req.Position, req.Scale);
+				if (player != null)
+				{
+					var stream = _audioManager.LoadSound(soundData.Filename);
+					if (stream != null)
+					{
+						player.Stream = stream;
+						player.Autoplay = true;
+					}
+					container.AddChild(player);
+				}
+			}
+		}
+
+		if (req.AnimPaths != null && req.AnimPaths.Count > 0)
+		{
+			TryLoadAnimations(req, container);
+		}
+	}
+
+	private void OnObjectPicked(Node3D pickedNode, Vector3 position, uint formId)
+	{
+		if (formId != 0)
+		{
+			GD.Print($"[Megaton] Picked object FormId=0x{formId:X8}: {pickedNode?.Name}");
+			if (_hud != null)
+				_hud.ShowInfo($"Selected: 0x{formId:X8}");
+		}
+		else if (pickedNode != null)
+		{
+			GD.Print($"[Megaton] Picked node: {pickedNode.Name}");
+			if (_hud != null)
+				_hud.ShowInfo($"Selected: {pickedNode.Name}");
+		}
+	}
+
+	private void TryLoadAnimations(InstanceRequest req, Node3D container)
+	{
+		foreach (var kfPath in req.AnimPaths)
+		{
+			var anims = _animationManager.LoadKfAnimations(kfPath);
+			if (anims == null || anims.Count == 0) continue;
+
+			var skinnedNodes = container.GetChildren().OfType<Node3D>()
+				.SelectMany(c => c.GetChildren().OfType<Skeleton3D>())
+				.ToList();
+
+			foreach (var skel in skinnedNodes)
+			{
+				int meshIdx = skel.GetChildCount() > 0 ? 0 : -1;
+				if (meshIdx < 0) continue;
+
+				var nifPath = req.Path;
+				if (_nifCache.TryGetValue(nifPath, out var nifReader))
+				{
+					foreach (var anim in anims)
+					{
+						var geom = NIFMeshBuilder.ExtractGeometry(nifReader);
+						if (geom.Skeleton != null)
+						{
+							_animationManager.AttachAnimationPlayer(skel, anim, geom.Skeleton);
+							break;
+						}
+					}
+				}
 			}
 		}
 	}

@@ -306,12 +306,10 @@ namespace OpenFo3.World
             else if (light is SpotLight3D spot2)
                 spot2.SpotRange = radius;
 
-            // Position is already in Godot space (converted in Megaton.cs ProcessRecord).
-            // No re-conversion needed. Rotation: same axis mapping as mesh instances.
             var basis = Basis.Identity;
-            basis = basis.Rotated(Vector3.Up,     -rotation.Z);
-            basis = basis.Rotated(Vector3.Forward, rotation.Y);
             basis = basis.Rotated(Vector3.Right,   rotation.X);
+            basis = basis.Rotated(Vector3.Forward, rotation.Y);
+            basis = basis.Rotated(Vector3.Up,      rotation.Z);
             light.Transform = new Transform3D(basis, position);
 
             return light;

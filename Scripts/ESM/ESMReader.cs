@@ -155,19 +155,12 @@ namespace OpenFo3.ESM
         {
             lock (_lock)
             {
-                try
-                {
-                    long currentPos = _stream.Position;
-                    _stream.Position = record.FileOffset;
-                    if (record.Size > 100 * 1024 * 1024) return Array.Empty<byte>();
-                    byte[] data = _reader.ReadBytes((int)record.Size);
-                    _stream.Position = currentPos;
-                    return data;
-                }
-                catch (Exception)
-                {
-                    throw;
-                }
+                long currentPos = _stream.Position;
+                _stream.Position = record.FileOffset;
+                if (record.Size > 100 * 1024 * 1024) return Array.Empty<byte>();
+                byte[] data = _reader.ReadBytes((int)record.Size);
+                _stream.Position = currentPos;
+                return data;
             }
         }
 
@@ -176,7 +169,7 @@ namespace OpenFo3.ESM
             var subRecords = new List<SubRecord>();
             byte[] data = ReadRecordData(record);
             
-            if ((record.Flags & 0x00040000) != 0) 
+            if ((record.Flags & 0x00040000) != 0 && data.Length >= 8)
             {
                 uint uncompressedSize = BitConverter.ToUInt32(data, 0);
                 byte[] compressedData = new byte[data.Length - 4];
